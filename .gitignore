@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+data/local/
+.worktrees/
+# Internal planning copies contain local paths and are not public deliverables.
+/docs/diagnostico-inicial.md
+/docs/revisao-prompt-injection.md
+/docs/escopo-projeto.md
+/docs/architecture-and-stack.md
