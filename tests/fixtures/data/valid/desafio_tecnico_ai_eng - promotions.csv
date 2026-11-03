@@ -1,0 +1,4 @@
+promotion_id,product_id,discount_percent,description,is_active
+100,10,10,Promo Teste,1
+101,10,40,Black Friday Teste,0
+102,11,12.5,Campanha Teste,1

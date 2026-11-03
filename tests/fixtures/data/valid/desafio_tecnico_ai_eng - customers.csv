@@ -1,0 +1,3 @@
+customer_id,name,phone,email,city
+1,Cliente Teste Um,(00) 90000-0001,cliente01@example.invalid,São Paulo
+2,Cliente Teste Dois,(00) 90000-0002,cliente02@example.invalid,Recife
