@@ -85,7 +85,7 @@ Count: 59 distinct case IDs. D01–D09 (9), D10–D19 and D39 (11), D20–D38 (1
 | D12 | Invalid UTF-8 | byte `0xFF` in customers | `encoding_invalid`, file name | test_data_preparation.py |
 | D13 | Empty file | categories empty | `header_missing`, line None | test_data_preparation.py |
 | D14 | Duplicate header | repeat `name` in categories header | `header_duplicate`, column `name` | test_data_preparation.py |
-| D15 | Missing / extra header | drop `notes`; add `extra` | `header_mismatch`, column `notes` / `extra` | test_data_preparation.py |
+| D15 | Missing / extra header | drop `notes`; add `extra` | `header_mismatch`, column `notes` / column `None`; the unexpected name does not appear in the error (amendment approved in review 02-04-R1) | test_data_preparation.py |
 | D16 | Wrong field count | extra field on products line 3; blank line inside orders | `field_count`, exact line | test_data_preparation.py |
 | D17 | Malformed quoting | unbalanced quote in products | `csv_malformed`, file name | test_data_preparation.py |
 | D18 | Duplicate key | repeat product ID; repeat (order_id, product_id) in order_items | `duplicate_key`, line of second occurrence, column of key | test_data_preparation.py |

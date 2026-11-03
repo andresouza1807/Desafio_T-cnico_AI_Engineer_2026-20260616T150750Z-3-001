@@ -107,7 +107,7 @@ Deferred, non-blocking for this specification:
 - Encoding: UTF-8. An optional UTF-8 BOM is removed. Invalid UTF-8 raises `encoding_invalid`.
 - Dialect: comma delimiter, `"` quote character, doubled quote as escape, `strict=True`. LF and CRLF line endings are both accepted. A final line ending is optional. Quoted fields may contain commas and line breaks.
 - First record is the header. An empty file raises `header_missing`.
-- A header with a duplicate name raises `header_duplicate`. A missing or unexpected column raises `header_mismatch`; the error names the column (a column name is not a cell value).
+- A header with a duplicate name raises `header_duplicate`. A missing or unexpected column raises `header_mismatch`. The error names a column only when it is a schema column name: the missing column, or the repeated name when it belongs to the schema. A header name that is not a schema column name is never echoed; the error then has `column=None`. (Amendment approved in review 02-04-R1.)
 - Every data record must have exactly the header's field count, else `field_count`. A blank line inside the file is a record with zero fields and also raises `field_count`.
 - Malformed quoting or a NUL byte raises `csv_malformed`.
 - A file with a valid header and zero data records is structurally valid. Referential rules may still fail.

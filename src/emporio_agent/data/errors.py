@@ -44,3 +44,35 @@ class FieldError(ValueError):
     def __init__(self, code: IssueCode) -> None:
         self.code = IssueCode(code)
         super().__init__(self.code.value)
+
+
+class DataPreparationError(Exception):
+    """A source file failed preparation.
+
+    Carries the code and a location: source base name, physical line and column name.
+    It never carries a cell value or a directory path. args == (str(self),).
+    """
+
+    code: IssueCode
+    file_name: str | None
+    line: int | None
+    column: str | None
+
+    def __init__(
+        self,
+        code: IssueCode,
+        *,
+        file_name: str | None = None,
+        line: int | None = None,
+        column: str | None = None,
+    ) -> None:
+        self.code = IssueCode(code)
+        self.file_name = file_name
+        self.line = line
+        self.column = column
+        location = file_name or ""
+        if line is not None:
+            location = f"{location} line {line}".lstrip()
+        if column is not None:
+            location = f"{location}, column {column}" if location else f"column {column}"
+        super().__init__(f"{location}: {self.code.value}" if location else self.code.value)
