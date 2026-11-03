@@ -1,7 +1,7 @@
 """Slice 03 unit cases (docs/plans/03-catalog.md).
 
 Slice A: C03, C07, C20. Slice B: C35, C36, C42, C43, C49, C51 and the normalization
-rows of C37 and C38.
+rows of C37 and C38. Slice C: C64 and the closed-connection part of C63.
 
 Pure rules and argument validation, no database file. Validation tests pass a closed
 connection: if any query ran before validation, sqlite3.ProgrammingError would escape
@@ -10,6 +10,7 @@ instead of CatalogInputError.
 
 import sqlite3
 import traceback
+import typing
 from decimal import Decimal
 
 import pytest
@@ -17,9 +18,11 @@ import pytest
 from emporio_agent.services.catalog import (
     CatalogDataError,
     CatalogInputError,
+    PaymentMethod,
     availability_of,
     get_product,
     normalize_search_text,
+    quote_product,
     search_products,
 )
 
@@ -248,3 +251,76 @@ def test_c51_text_must_be_str(field, value):
 def test_c51_first_invalid_argument_in_parameter_order():
     error = search_error(query=123, offset=-1)
     assert (error.field, error.code) == ("query", "invalid_type")
+
+
+# --- Slice C ------------------------------------------------------------------------
+
+
+def quote_error(product_id: object, **arguments) -> CatalogInputError:
+    with pytest.raises(CatalogInputError) as caught:
+        quote_product(closed_connection(), product_id, **arguments)
+    error = caught.value
+    assert isinstance(error, ValueError)
+    assert str(error) == f"{error.field}: {error.code}"
+    assert error.args == (str(error),)
+    return error
+
+
+# --- C63 (closed-connection part): product_id validated before any query -----------
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        (True, "invalid_type"),
+        (0, "out_of_range"),
+        (2**63, "out_of_range"),
+        ("201", "invalid_type"),
+        (None, "invalid_type"),
+    ],
+    ids=["true", "zero", "two_pow_63", "str", "none"],
+)
+def test_c63_invalid_product_id_rejected_before_any_query(value, code):
+    error = quote_error(value, payment_method="pix")
+    assert (error.field, error.code) == ("product_id", code)
+
+
+def test_c63_product_id_checked_before_payment_method():
+    error = quote_error(True, payment_method="PIX")
+    assert (error.field, error.code) == ("product_id", "invalid_type")
+
+
+# --- C64: payment_method exact, required, no default and no case folding -----------
+
+
+def test_c64_payment_method_type():
+    assert typing.get_args(PaymentMethod.__value__) == ("regular", "pix")
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ("PIX", "unknown_value"),
+        ("", "unknown_value"),
+        ("credit_3x", "unknown_value"),
+        (None, "invalid_type"),
+        (True, "invalid_type"),
+    ],
+    ids=["upper_pix", "empty", "credit_3x", "none", "true"],
+)
+def test_c64_invalid_payment_method_rejected_before_any_query(value, code):
+    error = quote_error(201, payment_method=value)
+    assert (error.field, error.code) == ("payment_method", code)
+
+
+def test_c64_payment_method_is_required():
+    with pytest.raises(TypeError) as caught:
+        quote_product(closed_connection(), 201)
+    assert not isinstance(caught.value, CatalogInputError)
+    assert "payment_method" in str(caught.value)
+
+
+def test_c64_payment_method_is_keyword_only():
+    with pytest.raises(TypeError) as caught:
+        quote_product(closed_connection(), 201, "pix")
+    assert not isinstance(caught.value, CatalogInputError)

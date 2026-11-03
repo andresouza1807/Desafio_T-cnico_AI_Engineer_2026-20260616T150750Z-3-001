@@ -1,4 +1,4 @@
-"""Read-only catalog service: product detail, availability and search (Slice 03, A and B).
+"""Read-only catalog service: product detail, availability, search and quote (Slice 03).
 
 Reads a prepared SQLite database through a connection opened by the caller with
 connect_readonly, and prices products only through quote_price. The caller owns the
@@ -34,6 +34,7 @@ from emporio_agent.services.pricing import CENT, PriceQuote, Promotion, quote_pr
 type Availability = Literal["available", "out_of_stock", "discontinued", "coming_soon"]
 type QualityNoteCode = Literal["catalog_text_conflict", "status_stock_conflict"]
 type CategoryResolution = Literal["not_requested", "resolved", "unknown", "ambiguous"]
+type PaymentMethod = Literal["regular", "pix"]
 
 PAGE_SIZE: Final = 5
 MAX_TEXT_LENGTH: Final = 4000
@@ -41,11 +42,19 @@ MAX_PRICE_BRL: Final = Decimal("92233720368547758.07")  # SQLITE_MAX_INTEGER cen
 
 _PROVENANCE_TABLES: Final = ("categories", "products", "promotions")
 _WITHHELD_FIELDS: Final = ("description", "specs")
+_PAYMENT_METHODS: Final = ("regular", "pix")
 
 # Fixed statements. Only product_id and the constant entity are ever bound.
 _PRODUCT_SQL: Final = (
     "SELECT p.product_id, p.category_id, p.name, p.description, p.price_cents,"
     " p.stock_quantity, p.status, p.specs_json, c.category_id, c.name"
+    " FROM products AS p JOIN categories AS c ON c.category_id = p.category_id"
+    " WHERE p.product_id = ?"
+)
+# Quote: the summary columns only; a quote carries no description or specs.
+_SUMMARY_SQL: Final = (
+    "SELECT p.product_id, p.category_id, p.name, p.price_cents, p.stock_quantity,"
+    " p.status, c.category_id, c.name"
     " FROM products AS p JOIN categories AS c ON c.category_id = p.category_id"
     " WHERE p.product_id = ?"
 )
@@ -163,6 +172,19 @@ class SearchResult:
 
 
 @dataclass(frozen=True)
+class ProductQuote:
+    product: ProductSummary  # effective_price is always the regular price
+    payment_method: PaymentMethod
+    list_price: Decimal
+    final_price: Decimal  # price for payment_method
+    discount_percent: Decimal
+    discount_source: Literal["none", "pix", "promotion"]
+    promotion: AppliedPromotion | None
+    pix_not_combined: bool  # pix requested and an active promotion applied
+    provenance: Provenance
+
+
+@dataclass(frozen=True)
 class _PromotionRow:
     promotion_id: int
     discount_percent: Decimal
@@ -274,6 +296,11 @@ def _applied_promotion(
     return AppliedPromotion(chosen.promotion_id, chosen.discount_percent, chosen.description)
 
 
+def _pricing_promotions(promotions: Sequence[_PromotionRow]) -> list[Promotion]:
+    # Active and inactive promotions: quote_price validates both and applies the largest.
+    return [Promotion(item.discount_percent, item.is_active) for item in promotions]
+
+
 def _specs(value: object) -> Mapping[str, object]:
     parsed = json.loads(_text(value))
     if not isinstance(parsed, dict):
@@ -306,11 +333,10 @@ def _summary(
     availability = availability_of(status, stock)
     category = CategoryRef(_integer(category_ref_id), _text(category_name))
 
-    # Active and inactive promotions: quote_price validates both and applies the largest.
     quote = quote_price(
         cents_to_decimal(_integer(price_cents)),
         payment_method="regular",
-        promotions=[Promotion(item.discount_percent, item.is_active) for item in promotions],
+        promotions=_pricing_promotions(promotions),
     )
     return ProductSummary(
         product_id=_integer(product_id),
@@ -555,3 +581,72 @@ def search_products(
         candidate_categories=(),
         provenance=provenance,
     )
+
+
+# --- Quote (slice C) ------------------------------------------------------------------
+
+
+def _check_payment_method(value: object) -> PaymentMethod:
+    """Exactly "regular" or "pix": no default, no case folding (spec P-05, A4)."""
+    if type(value) is not str:
+        raise CatalogInputError("payment_method", "invalid_type")
+    if value not in _PAYMENT_METHODS:
+        raise CatalogInputError("payment_method", "unknown_value")
+    return value
+
+
+def _quote(
+    product_row: tuple[object, ...],
+    promotion_rows: list[tuple[object, ...]],
+    note_rows: list[tuple[object, ...]],
+    payment_method: PaymentMethod,
+    provenance: Provenance,
+) -> ProductQuote:
+    promotions = [_promotion(row) for row in promotion_rows]
+    notes = tuple(sorted(_note(row) for row in note_rows))
+    summary = _summary(product_row, promotions, notes)
+    # Money comes only from quote_price; nothing is recomputed here.
+    quote = quote_price(
+        summary.list_price,
+        payment_method=payment_method,
+        promotions=_pricing_promotions(promotions),
+    )
+    return ProductQuote(
+        product=summary,
+        payment_method=payment_method,
+        list_price=quote.list_price,
+        final_price=quote.final_price,
+        discount_percent=quote.discount_percent,
+        discount_source=quote.discount_source,
+        promotion=_applied_promotion(quote, promotions),
+        pix_not_combined=payment_method == "pix" and quote.discount_source == "promotion",
+        provenance=provenance,
+    )
+
+
+def quote_product(
+    connection: sqlite3.Connection,
+    product_id: int,
+    *,
+    payment_method: PaymentMethod,
+) -> ProductQuote | None:
+    """Return one unit quote for "regular" or "pix"; a quote creates no purchase.
+
+    None when no product has this ID. An unavailable product is quoted too, with its
+    availability: the quote states the registered price, it is not an offer to sell.
+    Arguments are validated in parameter order before any query (CatalogInputError);
+    the product, its category, all its promotions and its notes are validated like in
+    get_product (CatalogDataError). description and specs_json are never read.
+    """
+    product_id = _check_product_id(product_id)
+    payment_method = _check_payment_method(payment_method)
+    product_rows = _fetch_all(connection, _SUMMARY_SQL, (product_id,))
+    if not product_rows:
+        return None
+    promotion_rows = _fetch_all(connection, _PROMOTIONS_SQL, (product_id,))
+    note_rows = _fetch_all(connection, _NOTES_SQL, (QUALITY_ENTITY_PRODUCT, product_id))
+    provenance = _provenance(connection)
+    try:
+        return _quote(product_rows[0], promotion_rows, note_rows, payment_method, provenance)
+    except TypeError, ValueError:
+        raise CatalogDataError("invalid_row") from None

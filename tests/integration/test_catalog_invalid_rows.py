@@ -1,6 +1,7 @@
-"""Invalid-row cases C68-C75 (docs/plans/03-catalog.md, spec P-12 and P-15).
+"""Invalid-row cases C68-C76 (docs/plans/03-catalog.md, spec P-12 and P-15).
 
-Slice A: C68-C74 (get_product). Slice B: C75 (search_products).
+Slice A: C68-C74 (get_product). Slice B: C75 (search_products). Slice C: C76
+(quote_product).
 
 Each case builds a real database with catalog_kit, stores one invalid value with
 catalog_kit.corrupt (PRAGMA ignore_check_constraints or an untyped table rebuild),
@@ -16,7 +17,12 @@ from pathlib import Path
 import pytest
 
 from emporio_agent.data.readonly import connect_readonly
-from emporio_agent.services.catalog import CatalogDataError, get_product, search_products
+from emporio_agent.services.catalog import (
+    CatalogDataError,
+    get_product,
+    quote_product,
+    search_products,
+)
 
 SENTINEL = "SENTINEL-9c1e"
 
@@ -327,3 +333,47 @@ def test_c75_malformed_specs_do_not_fail_search(tmp_path, catalog_kit):
     assert result.total_matches == 14
     assert [item.product_id for item in result.products] == [211, 214, 212, 210, 201]
     assert result.next_offset == 5
+
+
+# --- C76: a quote validates the rows it reads, like get_product ---------------------
+
+
+def test_c76_invalid_promotion_fails_the_quote(tmp_path, catalog_kit):
+    path = corrupted(tmp_path, catalog_kit, "percent_over")
+    assert stored(
+        catalog_kit,
+        path,
+        "SELECT typeof(discount_basis_points), discount_basis_points, product_id, is_active"
+        " FROM promotions WHERE promotion_id = ?",
+        (301,),
+    ) == [("integer", 20000, 202, 1)]
+    before = catalog_kit.snapshot(path)
+
+    with connect_readonly(path) as connection:
+        with pytest.raises(CatalogDataError) as caught:
+            quote_product(connection, 202, payment_method="pix")
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+        assert connection.row_factory is sqlite3.Row
+        # Promotion 301 belongs to product 202 only: a quote of 201 never reads it.
+        other = quote_product(connection, 201, payment_method="pix")
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+    error = caught.value
+    assert error.reason == "invalid_row"
+    assert str(error) == "invalid_row"
+    assert error.args == ("invalid_row",)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert not isinstance(error, (TypeError, ValueError))
+    assert raised_by_quote_price(error)
+    for surface in public_surfaces(error):
+        assert "20000" not in surface
+        assert "200" not in surface
+        assert "Promo Folk" not in surface
+
+    assert other is not None
+    assert format(other.final_price, "f") == "854.91"
+    assert other.discount_source == "pix"
+    assert catalog_kit.snapshot(path) == before
