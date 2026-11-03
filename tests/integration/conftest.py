@@ -724,10 +724,24 @@ def orders_rows() -> dict[str, list[list[str]]]:
     return copy.deepcopy(ORDERS_ROWS)
 
 
-def orders_build(base: Path) -> Path:
-    """Write the orders sources under base, prepare the database and return its path."""
+# Slice 05 part B: edits applied to the deep copy of the source rows before preparation.
+# "renamed": product 10 gets a new current name; its order items and totals are unchanged.
+_ORDERS_ROW_EDITS = {
+    "renamed": ("products", 0, "name", "Violão Teste Alfa Renomeado"),
+}
+
+
+def orders_build(base: Path, edit: str | None = None) -> Path:
+    """Write the orders sources under base, prepare the database and return its path.
+
+    With an edit, one cell of the deep copy of the rows changes before preparation.
+    """
+    rows = orders_rows()
+    if edit is not None:
+        table, index, column, text = _ORDERS_ROW_EDITS[edit]
+        set_cell(rows, table, index, column, text)
     source_dir = base / ORDERS_SOURCE_DIR
-    write_sources(source_dir, orders_rows())
+    write_sources(source_dir, rows)
     target_dir = base / ORDERS_DB_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / ORDERS_DB_NAME
@@ -752,6 +766,7 @@ def orders_kit():
     """Builder, clock spy and independent readers for the order tests."""
     return SimpleNamespace(
         PREPARED_AT=ORDERS_PREPARED_AT,
+        SOURCE_DIR=ORDERS_SOURCE_DIR,
         DB_NAME=ORDERS_DB_NAME,
         FIXED=ORDERS_FIXED,
         INJECTION_NAME=ORDERS_INJECTION_NAME,

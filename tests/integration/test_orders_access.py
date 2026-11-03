@@ -39,16 +39,43 @@ def lookup(path, order_id, customer, clock):
 
 def test_o01_authorized_order_header(orders_kit, orders_db):
     view = lookup(orders_db, 5001, C1, orders_kit.ClockSpy(orders_kit.FIXED))
+    # Slice B: source records read with independent SQL, not through the service.
+    sources = orders_kit.query(
+        orders_db,
+        "SELECT table_name, file_name, sha256, size_bytes, row_count FROM source_files"
+        " WHERE table_name IN (?, ?, ?)",
+        ("orders", "order_items", "products"),
+    )
+    columns = ("table_name", "file_name", "sha256", "size_bytes", "row_count")
+    by_table = {row[0]: dict(zip(columns, row, strict=True)) for row in sources}
 
     assert type(view) is OrderView
     assert dataclasses.asdict(view) == {
         "order_id": 5001,
         "status": "shipped",
+        "items": (
+            {
+                "product_id": 10,
+                "name": "Violão Teste Alfa",
+                "quantity": 2,
+                "name_source": "current_catalog",
+            },
+            {
+                "product_id": 11,
+                "name": "Teclado Teste Beta",
+                "quantity": 1,
+                "name_source": "current_catalog",
+            },
+        ),
         "total": Decimal("1500.00"),
         "tracking_code": "TRK-5001",
         "estimated_delivery": date(2026, 11, 3),
         "estimate_status": "due_today",
         "business_date": date(2026, 11, 3),
+        "provenance": {
+            "prepared_at": datetime(2026, 11, 2, 12, 0, tzinfo=UTC),
+            "sources": (by_table["orders"], by_table["order_items"], by_table["products"]),
+        },
     }
 
 
