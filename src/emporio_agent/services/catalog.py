@@ -1,4 +1,4 @@
-"""Read-only catalog service: product detail and availability (Slice 03, part A).
+"""Read-only catalog service: product detail, availability and search (Slice 03, A and B).
 
 Reads a prepared SQLite database through a connection opened by the caller with
 connect_readonly, and prices products only through quote_price. The caller owns the
@@ -8,10 +8,11 @@ row_factory. Errors carry codes only. See docs/specs/03-catalog.md.
 
 import json
 import sqlite3
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 from types import MappingProxyType
 from typing import Final, Literal
 
@@ -28,10 +29,15 @@ from emporio_agent.data.schema import (
     QUALITY_ENTITY_PRODUCT,
     QUALITY_NOTE_CODES,
 )
-from emporio_agent.services.pricing import PriceQuote, Promotion, quote_price
+from emporio_agent.services.pricing import CENT, PriceQuote, Promotion, quote_price
 
 type Availability = Literal["available", "out_of_stock", "discontinued", "coming_soon"]
 type QualityNoteCode = Literal["catalog_text_conflict", "status_stock_conflict"]
+type CategoryResolution = Literal["not_requested", "resolved", "unknown", "ambiguous"]
+
+PAGE_SIZE: Final = 5
+MAX_TEXT_LENGTH: Final = 4000
+MAX_PRICE_BRL: Final = Decimal("92233720368547758.07")  # SQLITE_MAX_INTEGER cents
 
 _PROVENANCE_TABLES: Final = ("categories", "products", "promotions")
 _WITHHELD_FIELDS: Final = ("description", "specs")
@@ -50,6 +56,24 @@ _PROMOTIONS_SQL: Final = (
 _NOTES_SQL: Final = (
     "SELECT entity_id, code FROM data_quality_notes WHERE entity = ? AND entity_id = ?"
 )
+# Search reads whole tables and filters in Python. No description or specs_json column.
+_ALL_CATEGORIES_SQL: Final = "SELECT category_id, name FROM categories ORDER BY category_id"
+_ALL_PRODUCTS_SQL: Final = (
+    "SELECT p.product_id, p.category_id, p.name, p.price_cents, p.stock_quantity,"
+    " p.status, c.category_id, c.name"
+    " FROM products AS p JOIN categories AS c ON c.category_id = p.category_id"
+    " ORDER BY p.product_id"
+)
+_ALL_PROMOTIONS_SQL: Final = (
+    "SELECT promotion_id, product_id, discount_basis_points, description, is_active"
+    " FROM promotions ORDER BY promotion_id"
+)
+_ALL_NOTES_SQL: Final = (
+    "SELECT entity_id, code FROM data_quality_notes WHERE entity = ? ORDER BY entity_id, code"
+)
+
+# Private context for budget checks: the caller's decimal context is never used or changed.
+_BUDGET_CONTEXT: Final = Context(prec=40)
 
 
 class CatalogInputError(ValueError):
@@ -125,6 +149,20 @@ class ProductDetail:
 
 
 @dataclass(frozen=True)
+class SearchResult:
+    products: tuple[ProductSummary, ...]  # at most PAGE_SIZE
+    total_matches: int
+    offset: int
+    next_offset: int | None
+    available_only: bool
+    max_price_brl: Decimal | None  # quantized echo
+    category_resolution: CategoryResolution
+    category: CategoryRef | None  # set when resolved
+    candidate_categories: tuple[CategoryRef, ...]  # unknown or ambiguous only
+    provenance: Provenance
+
+
+@dataclass(frozen=True)
 class _PromotionRow:
     promotion_id: int
     discount_percent: Decimal
@@ -164,8 +202,16 @@ def _fetch_all(
         raise CatalogDataError("query_failed") from None
 
 
-# Row checks raise TypeError or ValueError with fixed text; get_product turns them into
-# CatalogDataError("invalid_row"). No message ever contains a cell value.
+def _provenance(connection: sqlite3.Connection) -> Provenance:
+    info = read_preparation_info(connection)
+    return Provenance(
+        prepared_at=info.prepared_at,
+        sources=tuple(source for source in info.sources if source.table_name in _PROVENANCE_TABLES),
+    )
+
+
+# Row checks raise TypeError or ValueError with fixed text; the public functions turn
+# them into CatalogDataError("invalid_row"). No message ever contains a cell value.
 
 
 def _integer(value: object) -> int:
@@ -235,6 +281,52 @@ def _specs(value: object) -> Mapping[str, object]:
     return MappingProxyType(parsed)
 
 
+def _summary(
+    product_row: tuple[object, ...],
+    promotions: Sequence[_PromotionRow],
+    notes: tuple[QualityNoteCode, ...],
+) -> ProductSummary:
+    """Validate the used product fields and price the product through quote_price.
+
+    product_row: product_id, category_id, name, price_cents, stock_quantity, status,
+    joined category_id, joined category name. Shared by get_product and search_products.
+    """
+    (
+        product_id,
+        category_id,
+        name,
+        price_cents,
+        stock_quantity,
+        status,
+        category_ref_id,
+        category_name,
+    ) = product_row
+    _integer(category_id)
+    stock = _stock(stock_quantity)
+    availability = availability_of(status, stock)
+    category = CategoryRef(_integer(category_ref_id), _text(category_name))
+
+    # Active and inactive promotions: quote_price validates both and applies the largest.
+    quote = quote_price(
+        cents_to_decimal(_integer(price_cents)),
+        payment_method="regular",
+        promotions=[Promotion(item.discount_percent, item.is_active) for item in promotions],
+    )
+    return ProductSummary(
+        product_id=_integer(product_id),
+        name=_text(name),
+        category=category,
+        list_price=quote.list_price,
+        effective_price=quote.final_price,
+        promotion=_applied_promotion(quote, promotions),
+        stock_quantity=stock,
+        status=status,
+        availability=availability,
+        is_available=availability == "available",
+        quality_notes=notes,
+    )
+
+
 def _detail(
     product_row: tuple[object, ...],
     promotion_rows: list[tuple[object, ...]],
@@ -253,31 +345,21 @@ def _detail(
         category_ref_id,
         category_name,
     ) = product_row
-    _integer(category_id)
-    stock = _stock(stock_quantity)
-    availability = availability_of(status, stock)
-    category = CategoryRef(_integer(category_ref_id), _text(category_name))
     promotions = [_promotion(row) for row in promotion_rows]
     notes = tuple(sorted(_note(row) for row in note_rows))
-
-    # Active and inactive promotions: quote_price validates both and applies the largest.
-    quote = quote_price(
-        cents_to_decimal(_integer(price_cents)),
-        payment_method="regular",
-        promotions=[Promotion(item.discount_percent, item.is_active) for item in promotions],
-    )
-    summary = ProductSummary(
-        product_id=_integer(product_id),
-        name=_text(name),
-        category=category,
-        list_price=quote.list_price,
-        effective_price=quote.final_price,
-        promotion=_applied_promotion(quote, promotions),
-        stock_quantity=stock,
-        status=status,
-        availability=availability,
-        is_available=availability == "available",
-        quality_notes=notes,
+    summary = _summary(
+        (
+            product_id,
+            category_id,
+            name,
+            price_cents,
+            stock_quantity,
+            status,
+            category_ref_id,
+            category_name,
+        ),
+        promotions,
+        notes,
     )
     if CATALOG_TEXT_CONFLICT in notes:
         # Projection rule only: the stored text is neither read nor changed.
@@ -298,12 +380,178 @@ def get_product(connection: sqlite3.Connection, product_id: int) -> ProductDetai
         return None
     promotion_rows = _fetch_all(connection, _PROMOTIONS_SQL, (product_id,))
     note_rows = _fetch_all(connection, _NOTES_SQL, (QUALITY_ENTITY_PRODUCT, product_id))
-    info = read_preparation_info(connection)
-    provenance = Provenance(
-        prepared_at=info.prepared_at,
-        sources=tuple(source for source in info.sources if source.table_name in _PROVENANCE_TABLES),
-    )
+    provenance = _provenance(connection)
     try:
         return _detail(product_rows[0], promotion_rows, note_rows, provenance)
     except TypeError, ValueError:
         raise CatalogDataError("invalid_row") from None
+
+
+# --- Search (slice B) -----------------------------------------------------------------
+
+
+def normalize_search_text(text: str) -> str:
+    """NFKD, drop combining marks (category Mn), casefold, compact whitespace (spec G1)."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    return " ".join(stripped.casefold().split())
+
+
+def _check_text(field: str, value: object) -> str | None:
+    """None means no filter. Length in raw code points, checked before normalization."""
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise CatalogInputError(field, "invalid_type")
+    if len(value) > MAX_TEXT_LENGTH:
+        raise CatalogInputError(field, "too_long")
+    if not normalize_search_text(value):
+        raise CatalogInputError(field, "blank")
+    return value
+
+
+def _check_budget(value: object) -> Decimal | None:
+    """Exact Decimal in cents from 0 to MAX_PRICE_BRL, never rounded (spec G4)."""
+    if value is None:
+        return None
+    if type(value) is not Decimal:
+        raise CatalogInputError("max_price_brl", "invalid_type")
+    if not value.is_finite():
+        raise CatalogInputError("max_price_brl", "not_finite")
+    with localcontext(_BUDGET_CONTEXT):
+        if value < 0:
+            raise CatalogInputError("max_price_brl", "negative")
+        if value > MAX_PRICE_BRL:
+            raise CatalogInputError("max_price_brl", "out_of_range")
+        quantized = value.quantize(CENT)
+        if quantized != value:
+            raise CatalogInputError("max_price_brl", "excess_precision")
+    return quantized.copy_abs()  # 0.00, never -0.00
+
+
+def _check_available_only(value: object) -> bool:
+    if type(value) is not bool:
+        raise CatalogInputError("available_only", "invalid_type")
+    return value
+
+
+def _check_offset(value: object) -> int:
+    if type(value) is not int:
+        raise CatalogInputError("offset", "invalid_type")
+    if value < 0:
+        raise CatalogInputError("offset", "out_of_range")
+    return value
+
+
+def _all_summaries(
+    product_rows: list[tuple[object, ...]],
+    promotion_rows: list[tuple[object, ...]],
+    note_rows: list[tuple[object, ...]],
+) -> list[ProductSummary]:
+    """Validate every promotion, note and product row read, then summarize every product."""
+    promotions: dict[int, list[_PromotionRow]] = {}
+    for row in promotion_rows:
+        promotions.setdefault(_integer(row[1]), []).append(_promotion(row))
+    notes: dict[int, list[QualityNoteCode]] = {}
+    for row in note_rows:
+        notes.setdefault(_integer(row[0]), []).append(_note(row))
+    summaries = []
+    for row in product_rows:
+        product_id = _integer(row[0])
+        product_notes = tuple(sorted(notes.get(product_id, ())))
+        summaries.append(_summary(row, promotions.get(product_id, ()), product_notes))
+    return summaries
+
+
+def _resolve_category(
+    category: str | None, categories: Sequence[CategoryRef]
+) -> tuple[CategoryResolution, CategoryRef | None, tuple[CategoryRef, ...]]:
+    """Exact name first, then normalized name (spec G2). Candidates in category_id order."""
+    if category is None:
+        return "not_requested", None, ()
+    ordered = sorted(categories, key=lambda item: item.category_id)
+    exact = [item for item in ordered if item.name == category]
+    if len(exact) == 1:
+        return "resolved", exact[0], ()
+    wanted = normalize_search_text(category)
+    similar = [item for item in ordered if normalize_search_text(item.name) == wanted]
+    if len(similar) == 1:
+        return "resolved", similar[0], ()
+    if similar:
+        return "ambiguous", None, tuple(similar)
+    return "unknown", None, tuple(ordered)
+
+
+def search_products(
+    connection: sqlite3.Connection,
+    *,
+    query: str | None = None,
+    category: str | None = None,
+    max_price_brl: Decimal | None = None,
+    available_only: bool = True,
+    offset: int = 0,
+) -> SearchResult:
+    """Filter by name tokens, category, budget and availability; sort; one page of five.
+
+    Arguments are validated in parameter order before any query (CatalogInputError).
+    Every category, product, promotion and product note is read and validated before
+    filtering (CatalogDataError("invalid_row")); description and specs_json are never
+    read. Effective prices come only from quote_price in regular mode; PIX never
+    takes part in the budget.
+    """
+    query = _check_text("query", query)
+    category = _check_text("category", category)
+    budget = _check_budget(max_price_brl)
+    available_only = _check_available_only(available_only)
+    offset = _check_offset(offset)
+
+    provenance = _provenance(connection)
+    category_rows = _fetch_all(connection, _ALL_CATEGORIES_SQL, ())
+    product_rows = _fetch_all(connection, _ALL_PRODUCTS_SQL, ())
+    promotion_rows = _fetch_all(connection, _ALL_PROMOTIONS_SQL, ())
+    note_rows = _fetch_all(connection, _ALL_NOTES_SQL, (QUALITY_ENTITY_PRODUCT,))
+    try:
+        categories = [CategoryRef(_integer(row[0]), _text(row[1])) for row in category_rows]
+        summaries = _all_summaries(product_rows, promotion_rows, note_rows)
+    except TypeError, ValueError:
+        raise CatalogDataError("invalid_row") from None
+
+    resolution, resolved, candidates = _resolve_category(category, categories)
+    if resolution in ("unknown", "ambiguous"):
+        # The filter is kept: nothing matches an unresolved category (spec G2, A3).
+        return SearchResult(
+            products=(),
+            total_matches=0,
+            offset=offset,
+            next_offset=None,
+            available_only=available_only,
+            max_price_brl=budget,
+            category_resolution=resolution,
+            category=None,
+            candidate_categories=candidates,
+            provenance=provenance,
+        )
+
+    tokens = normalize_search_text(query).split() if query is not None else []
+    matches = [
+        summary
+        for summary in summaries
+        if (summary.is_available or not available_only)
+        and (resolved is None or summary.category.category_id == resolved.category_id)
+        and all(token in normalize_search_text(summary.name) for token in tokens)
+        and (budget is None or summary.effective_price <= budget)
+    ]
+    matches.sort(key=lambda summary: (summary.effective_price, summary.product_id))
+    end = offset + PAGE_SIZE
+    return SearchResult(
+        products=tuple(matches[offset:end]),
+        total_matches=len(matches),
+        offset=offset,
+        next_offset=end if end < len(matches) else None,
+        available_only=available_only,
+        max_price_brl=budget,
+        category_resolution=resolution,
+        category=resolved,
+        candidate_categories=(),
+        provenance=provenance,
+    )

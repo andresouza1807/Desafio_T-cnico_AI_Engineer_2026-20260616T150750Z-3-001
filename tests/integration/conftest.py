@@ -365,6 +365,13 @@ _CATALOG_EDITS = {
     "no_products_table": ("DROP TABLE products", ()),
 }
 
+# Edits applied to the deep copy of the source rows before preparation (slice B).
+# "collision": a second category whose name differs from "Violões" only by case and
+# accents; Slice 02 enforces only exact uniqueness, so preparation accepts it.
+_CATALOG_ROW_EDITS = {
+    "collision": ("categories", ["4", "violoes", "Categoria em colisão"]),
+}
+
 # variant: (technique, table, column, value, where clause, where parameters)
 # "check": PRAGMA ignore_check_constraints = ON, then one UPDATE.
 # "rebuild": table rebuilt without declared types or constraints, then one UPDATE.
@@ -445,6 +452,16 @@ _CATALOG_VARIANTS = {
         "entity = ? AND entity_id = ?",
         ("product", 208),
     ),
+    # Slice B (C75): damaged rows of product 217, outside the Violões category.
+    "price_text_other": ("rebuild", "products", "price_cents", "abc", "product_id = ?", (217,)),
+    "specs_other_product": (
+        "check",
+        "products",
+        "specs_json",
+        '{"cordas": ',
+        "product_id = ?",
+        (217,),
+    ),
 }
 
 
@@ -460,16 +477,21 @@ def _catalog_writable(path: Path) -> sqlite3.Connection:
 def catalog_build(base: Path, edit: str | None = None) -> Path:
     """Write the catalog sources under base, prepare the database and return its path.
 
-    With edit, the built file is copied to a second directory and the edit is applied
-    to the copy with a separate writable connection; the copy's path is returned.
+    With a database edit, the built file is copied to a second directory and the edit
+    is applied to the copy with a separate writable connection; the copy's path is
+    returned. A row edit changes the deep copy of the rows before preparation.
     """
+    rows = catalog_rows()
+    if edit in _CATALOG_ROW_EDITS:
+        table, row = _CATALOG_ROW_EDITS[edit]
+        rows[table].append(list(row))
     source_dir = base / CATALOG_SOURCE_DIR
-    write_sources(source_dir, catalog_rows())
+    write_sources(source_dir, rows)
     target_dir = base / CATALOG_DB_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / CATALOG_DB_NAME
     prepare_database(source_dir, target, clock=lambda: CATALOG_PREPARED_AT)
-    if edit is None:
+    if edit is None or edit in _CATALOG_ROW_EDITS:
         return target
     statement, parameters = _CATALOG_EDITS[edit]
     edited_dir = base / f"{CATALOG_DB_DIR}-{edit}"

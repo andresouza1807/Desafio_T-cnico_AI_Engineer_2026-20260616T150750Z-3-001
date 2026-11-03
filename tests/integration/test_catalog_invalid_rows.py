@@ -1,4 +1,6 @@
-"""Slice 03-A invalid-row cases C68-C74 (docs/plans/03-catalog.md, spec P-12 and P-15).
+"""Invalid-row cases C68-C75 (docs/plans/03-catalog.md, spec P-12 and P-15).
+
+Slice A: C68-C74 (get_product). Slice B: C75 (search_products).
 
 Each case builds a real database with catalog_kit, stores one invalid value with
 catalog_kit.corrupt (PRAGMA ignore_check_constraints or an untyped table rebuild),
@@ -14,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from emporio_agent.data.readonly import connect_readonly
-from emporio_agent.services.catalog import CatalogDataError, get_product
+from emporio_agent.services.catalog import CatalogDataError, get_product, search_products
 
 SENTINEL = "SENTINEL-9c1e"
 
@@ -276,3 +278,52 @@ def test_c74_connection_usable_after_query_failed(tmp_path, catalog_kit):
         connection.execute("SELECT 1")
 
     assert catalog_kit.snapshot(path) == before
+
+
+# --- C75: search validates every row it reads, but never reads specs ----------------
+
+
+def test_c75_invalid_row_outside_the_filter_fails_search(tmp_path, catalog_kit):
+    path = corrupted(tmp_path, catalog_kit, "price_text_other")
+    assert stored(
+        catalog_kit,
+        path,
+        "SELECT typeof(price_cents), price_cents, category_id FROM products WHERE product_id = ?",
+        (217,),
+    ) == [("text", "abc", 2)]
+    before = catalog_kit.snapshot(path)
+
+    with connect_readonly(path) as connection:
+        with pytest.raises(CatalogDataError) as caught:
+            search_products(connection, category="Violões")
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+        assert connection.row_factory is sqlite3.Row
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+
+    error = caught.value
+    assert error.reason == "invalid_row"
+    assert str(error) == "invalid_row"
+    assert error.args == ("invalid_row",)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert not isinstance(error, (TypeError, ValueError))
+    assert catalog_kit.snapshot(path) == before
+
+
+def test_c75_malformed_specs_do_not_fail_search(tmp_path, catalog_kit):
+    path = corrupted(tmp_path, catalog_kit, "specs_other_product")
+    assert stored(
+        catalog_kit,
+        path,
+        "SELECT typeof(specs_json), specs_json FROM products WHERE product_id = ?",
+        (217,),
+    ) == [("text", '{"cordas": ')]
+
+    with connect_readonly(path) as connection:
+        result = search_products(connection)
+        assert connection.row_factory is sqlite3.Row
+
+    assert result.total_matches == 14
+    assert [item.product_id for item in result.products] == [211, 214, 212, 210, 201]
+    assert result.next_offset == 5
