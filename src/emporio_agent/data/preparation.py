@@ -1,17 +1,23 @@
-"""Reading and validation of the store CSV files.
+"""Reading, validation and SQLite preparation of the store CSV files.
 
 This module holds the single-table reader of task T3 (structure and single fields,
-docs/specs/02-04-csv-reading.md) and the in-memory validation of keys and
-references across the six tables of task T4 (docs/specs/02-05-data-relations.md).
-Database construction belongs to a later task.
+docs/specs/02-04-csv-reading.md), the in-memory validation of keys and references
+across the six tables of task T4 (docs/specs/02-05-data-relations.md) and the
+build-and-replace of the database of task T5 (docs/specs/02-06-database-preparation.md).
 """
 
 import csv
 import hashlib
+import importlib.metadata
 import io
-from collections.abc import Callable
+import os
+import sqlite3
+import tempfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 
 from emporio_agent.data.errors import DataPreparationError, FieldError, IssueCode
 from emporio_agent.data.parsing import (
@@ -27,7 +33,19 @@ from emporio_agent.data.parsing import (
     parse_percent_basis_points,
     parse_text,
 )
-from emporio_agent.data.schema import SOURCE_FILE_PREFIX, TABLES, ColumnSpec, FieldKind, TableSpec
+from emporio_agent.data.schema import (
+    CATALOG_TEXT_CONFLICT,
+    DDL_STATEMENTS,
+    KNOWN_CATALOG_TEXT_CONFLICTS,
+    QUALITY_ENTITY_PRODUCT,
+    SCHEMA_VERSION,
+    SOURCE_FILE_PREFIX,
+    STATUS_STOCK_CONFLICT,
+    TABLES,
+    ColumnSpec,
+    FieldKind,
+    TableSpec,
+)
 
 type FieldValue = int | str | None
 
@@ -270,3 +288,228 @@ def read_validated_tables(
         parent_keys[table.name] = _primary_key_index(table, reading)
         readings.append(reading)
     return tuple(readings)
+
+
+# --- T5: build and replace -------------------------------------------------------------
+
+_DISTRIBUTION = "emporio-agent"
+_STOCK_CONFLICT_STATUSES = frozenset({"discontinued", "coming_soon"})
+
+type _Row = tuple[FieldValue, ...]
+
+
+@dataclass(frozen=True)
+class PreparationResult:
+    database_path: Path = field(repr=False)
+    schema_version: int
+    prepared_at: datetime
+    sources: tuple[SourceFileInfo, ...]
+    row_counts: Mapping[str, int]
+    quality_note_count: int
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _prepared_at(clock: Callable[[], datetime]) -> datetime:
+    value = clock()
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise ValueError("clock must return a timezone-aware datetime")
+    return value.astimezone(UTC)
+
+
+def _same_file(target: Path, source: Path, target_stat: os.stat_result | None) -> bool:
+    if os.path.normcase(os.path.realpath(target)) == os.path.normcase(os.path.realpath(source)):
+        return True
+    if target_stat is None or target_stat.st_ino == 0:
+        return False
+    try:
+        return os.path.samestat(target_stat, os.stat(source))
+    except OSError:
+        return False
+
+
+def _is_source_file(
+    database_path: Path, source_dir: Path, readings: tuple[TableReading, ...]
+) -> bool:
+    try:
+        target_stat: os.stat_result | None = os.stat(database_path)
+    except OSError:
+        target_stat = None
+    return any(
+        _same_file(database_path, source_dir / reading.source.file_name, target_stat)
+        for reading in readings
+    )
+
+
+def _quality_notes(readings: tuple[TableReading, ...]) -> tuple[_Row, ...]:
+    """Notes per product in source line order: status and stock rule, then curated IDs."""
+    table, reading = next(
+        (table, reading)
+        for table, reading in zip(TABLES, readings, strict=True)
+        if table.name == "products"
+    )
+    product_id = _position(table, "product_id")
+    status = _position(table, "status")
+    stock = _position(table, "stock_quantity")
+    notes: list[_Row] = []
+    for record in reading.records:
+        values = record.values
+        identifier = values[product_id]
+        if values[status] in _STOCK_CONFLICT_STATUSES and int(values[stock] or 0) > 0:
+            notes.append((QUALITY_ENTITY_PRODUCT, identifier, STATUS_STOCK_CONFLICT))
+        if identifier in KNOWN_CATALOG_TEXT_CONFLICTS:
+            notes.append((QUALITY_ENTITY_PRODUCT, identifier, CATALOG_TEXT_CONFLICT))
+    return tuple(notes)
+
+
+def _insert_sql(table: str, columns: tuple[str, ...]) -> str:
+    # Identifiers come only from the internal schema, never from input.
+    placeholders = ", ".join("?" for _ in columns)
+    return f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
+
+
+def _rollback_and_close_quietly(connection: sqlite3.Connection) -> None:
+    # Cleanup never replaces the primary error.
+    try:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+    try:
+        connection.close()
+    except sqlite3.Error:
+        pass
+
+
+def _write_database(
+    temporary: str,
+    readings: tuple[TableReading, ...],
+    metadata: tuple[_Row, ...],
+    notes: tuple[_Row, ...],
+) -> None:
+    """Build the whole database in one explicit transaction, then commit and close.
+
+    autocommit=True: the sqlite3 module opens and ends no transaction implicitly, so
+    BEGIN, COMMIT and ROLLBACK are explicit SQL and Connection.commit() is not used.
+    """
+    connection = sqlite3.connect(temporary, autocommit=True)
+    try:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN")
+        for statement in DDL_STATEMENTS:
+            connection.execute(statement)
+        for table, reading in zip(TABLES, readings, strict=True):
+            columns = tuple(column.column_name for column in table.columns)
+            connection.executemany(
+                _insert_sql(table.name, columns), (record.values for record in reading.records)
+            )
+        connection.executemany(_insert_sql("preparation_metadata", ("key", "value")), metadata)
+        connection.executemany(
+            _insert_sql(
+                "source_files", ("table_name", "file_name", "sha256", "size_bytes", "row_count")
+            ),
+            (
+                (s.table_name, s.file_name, s.sha256, s.size_bytes, s.row_count)
+                for s in (reading.source for reading in readings)
+            ),
+        )
+        connection.executemany(
+            _insert_sql("data_quality_notes", ("entity", "entity_id", "code")), notes
+        )
+        foreign_key_findings = connection.execute("PRAGMA foreign_key_check").fetchall()
+        integrity = connection.execute("PRAGMA integrity_check").fetchall()
+        if foreign_key_findings or integrity != [("ok",)]:
+            raise DataPreparationError(IssueCode.INTEGRITY_CHECK_FAILED) from None
+        connection.execute("COMMIT")
+    except BaseException:
+        _rollback_and_close_quietly(connection)
+        raise
+    connection.close()
+
+
+def _remove_leftovers(temporary: str) -> None:
+    # Only the files of this run. A failed removal is a known limit and never raised.
+    for path in (temporary, temporary + "-journal"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _build_temporary(
+    database_path: Path,
+    readings: tuple[TableReading, ...],
+    metadata: tuple[_Row, ...],
+    notes: tuple[_Row, ...],
+) -> str:
+    try:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{database_path.name}.", suffix=".tmp", dir=database_path.parent
+        )
+    except OSError:
+        raise DataPreparationError(IssueCode.DATABASE_BUILD_FAILED) from None
+    try:
+        os.close(descriptor)
+        _write_database(temporary, readings, metadata, notes)
+    except sqlite3.Error, OSError:
+        _remove_leftovers(temporary)
+        raise DataPreparationError(IssueCode.DATABASE_BUILD_FAILED) from None
+    except BaseException:
+        _remove_leftovers(temporary)
+        raise
+    return temporary
+
+
+def prepare_database(
+    source_dir: Path,
+    database_path: Path,
+    *,
+    file_prefix: str = SOURCE_FILE_PREFIX,
+    clock: Callable[[], datetime] = _utc_now,
+) -> PreparationResult:
+    """Validate the six source files and publish a new SQLite database.
+
+    Order: target directory, clock, sources (read_validated_tables), target not a
+    source file, importer version; then build in a temporary file of the target
+    directory and os.replace it over database_path. Nothing runs after the replace
+    except the return. See docs/specs/02-06-database-preparation.md.
+    """
+    if not database_path.parent.is_dir():
+        raise DataPreparationError(IssueCode.TARGET_DIRECTORY_MISSING)
+    prepared_at = _prepared_at(clock)
+    readings = read_validated_tables(source_dir, file_prefix=file_prefix)
+    if _is_source_file(database_path, source_dir, readings):
+        raise ValueError("database_path must not be a source file")
+    importer_version = importlib.metadata.version(_DISTRIBUTION)
+
+    metadata: tuple[_Row, ...] = (
+        ("schema_version", str(SCHEMA_VERSION)),
+        ("prepared_at", prepared_at.isoformat()),
+        ("importer_version", importer_version),
+    )
+    notes = _quality_notes(readings)
+    result = PreparationResult(
+        database_path=database_path,
+        schema_version=SCHEMA_VERSION,
+        prepared_at=prepared_at,
+        sources=tuple(reading.source for reading in readings),
+        row_counts=MappingProxyType(
+            {reading.source.table_name: reading.source.row_count for reading in readings}
+        ),
+        quality_note_count=len(notes),
+    )
+
+    temporary = _build_temporary(database_path, readings, metadata, notes)
+    try:
+        os.replace(temporary, database_path)
+    except OSError:
+        _remove_leftovers(temporary)
+        raise DataPreparationError(IssueCode.TARGET_WRITE_FAILED) from None
+    except BaseException:
+        _remove_leftovers(temporary)
+        raise
+    return result
