@@ -10,6 +10,7 @@ logging, no cache. See docs/specs/06-tools.md.
 """
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +31,7 @@ from emporio_agent.services.catalog import (
     ProductQuote,
     ProductSummary,
     Provenance,
+    SearchResult,
 )
 from emporio_agent.services.orders import CustomerContext
 
@@ -44,6 +46,8 @@ _DECIMAL_CONTEXT: Final = Context(prec=60)
 # Private context for JSON number parsing: always traps InvalidOperation. Decimal(text)
 # is exact and ignores precision; localcontext() works on a copy, so flags never leak.
 _NUMBER_CONTEXT: Final = Context(traps=[InvalidOperation])
+# Approved max_price_brl text (spec A6, G6), always applied with fullmatch.
+_BUDGET_PATTERN: Final = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]{1,2})?$")
 
 
 class _ToolFailure(Exception):
@@ -89,6 +93,15 @@ class ToolExecution:
 
 class _Arguments(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+
+class _SearchProductsArguments(_Arguments):
+    # Absent fields take the service defaults; null is accepted for the three filters only.
+    query: str | None = None
+    category: str | None = None
+    max_price_brl: str | None = None
+    available_only: bool = True
+    offset: int = 0
 
 
 class _GetProductArguments(_Arguments):
@@ -194,6 +207,24 @@ def _quote_data(quote: ProductQuote) -> dict[str, object]:
     }
 
 
+def _search_data(result: SearchResult) -> dict[str, object]:
+    # The query text is never echoed (spec G8, G14).
+    budget = result.max_price_brl
+    return {
+        "products": [_summary(product) for product in result.products],
+        "total_matches": result.total_matches,
+        "offset": result.offset,
+        "page_size": catalog.PAGE_SIZE,
+        "next_offset": result.next_offset,
+        "available_only": result.available_only,
+        "max_price_brl": None if budget is None else _two_places(budget),
+        "category_resolution": result.category_resolution,
+        "category": None if result.category is None else _category(result.category),
+        "candidate_categories": [_category(item) for item in result.candidate_categories],
+        "provenance": _provenance(result.provenance),
+    }
+
+
 def _dumps(envelope: dict[str, object]) -> str:
     return json.dumps(envelope, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
@@ -215,6 +246,31 @@ def _failure(tool: str | None, failure: _ToolFailure) -> ToolExecution:
 
 
 # --- Tool runners (spec G11: one read-only connection, closed on every path) ----------
+
+
+def _budget(text: str | None) -> Decimal | None:
+    """Tool-owned format check (spec G4 step 8, G6); the range stays in the service."""
+    if text is None:
+        return None
+    if _BUDGET_PATTERN.fullmatch(text) is None:
+        raise _ToolFailure("invalid_input", "invalid_format", "max_price_brl")
+    return Decimal(text)  # exact; never through float
+
+
+def _run_search_products(
+    arguments: _SearchProductsArguments, context: ToolContext
+) -> dict[str, object]:
+    budget = _budget(arguments.max_price_brl)  # before the resource is opened
+    with connect_readonly(context.database_path) as connection:
+        result = catalog.search_products(
+            connection,
+            query=arguments.query,
+            category=arguments.category,
+            max_price_brl=budget,
+            available_only=arguments.available_only,
+            offset=arguments.offset,
+        )
+    return _search_data(result)
 
 
 def _run_get_product(arguments: _GetProductArguments, context: ToolContext) -> dict[str, object]:
@@ -244,6 +300,7 @@ class _Tool:
 
 
 _REGISTRY: Final[Mapping[str, _Tool]] = {
+    "search_products": _Tool(_SearchProductsArguments, _run_search_products),
     "get_product": _Tool(_GetProductArguments, _run_get_product),
     "quote_product": _Tool(_QuoteProductArguments, _run_quote_product),
 }
