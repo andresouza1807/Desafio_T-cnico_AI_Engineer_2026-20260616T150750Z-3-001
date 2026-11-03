@@ -1,6 +1,6 @@
 # Slice 07 specification: OpenAI adapter and agent loop
 
-Status: proposed contract for review, 2026-11-03, revision R1 (applies review 07-01-R1; see "Review 07-01-R1"). Not implemented. No test in this document has been written or executed.
+Status: proposed contract for review, 2026-11-03, revision R1 (applies review 07-01-R1; see "Review 07-01-R1"), with the redirect clarification of review 07-02-R1 (see "Review 07-02-R1"). Slice A is implemented (report `docs/validation/07-01-openai-adapter.md`). Slices B–E are not implemented.
 Baseline: branch `feature/data-preparation`, HEAD `24e0ca11938888817f86bb68668879c170957240`, clean working tree before revision R0 (confirmed before writing). Last approved validation from the task brief and report 06-04: 1701 passed, 2 skipped; Ruff clean. The test suite was not re-run for this document.
 
 Sources, in precedence order:
@@ -248,6 +248,7 @@ class ProviderError(Exception):
 | `PermissionDeniedError` (403) | `permission` | no |
 | `NotFoundError` (404), or 400 with `code == "model_not_found"` | `model_unavailable` | no |
 | other `BadRequestError`, `UnprocessableEntityError`, other 4xx (includes an input larger than the context window, F8) | `bad_request` | no |
+| HTTP redirect (3xx): never followed, never repeated (review 07-02-R1) | `bad_request`, `retry_after_seconds None` | no |
 | body `status == "failed"` with `error.code` in {`server_error`, `rate_limit_exceeded`} | `provider_failed` | yes |
 | body `status == "failed"`, any other code or shape | `provider_failed` | no |
 | `APIResponseValidationError`, or a body that breaks G4b | `response_invalid` | no |
@@ -285,6 +286,7 @@ class OpenAIResponsesProvider:
 - Validation in `__init__`: `api_key` and `model` non-blank `str` without surrounding whitespace, `timeout_seconds` finite and > 0 (not `bool`), `max_output_tokens` `int` ≥ 1 (not `bool`); else `ValueError` with a fixed message (caller defect, no value echoed). `repr()` shows the model only.
 - `model` is sent exactly as configured. No alias, no fallback, no second model on error (A2). The reported model is recorded separately (a snapshot name for an alias is not a substitution, but both are shown in diagnostics).
 - `close()` closes the SDK client, which closes a supplied `http_client` too (F7). After `close()`, `create` raises `ProviderError("unexpected")` without a request.
+- Redirects (review 07-02-R1): the SDK default HTTP client sets `follow_redirects=True` (`_DefaultHttpxClient`), and `max_retries=0` does not limit redirects. A redirect is a new HTTP request that the transport client makes inside one `send`. It is not an SDK retry. The adapter never follows a redirect. Without `http_client`, it builds the SDK's exported `openai.DefaultHttpxClient(follow_redirects=False)`. With a supplied client (owned by the adapter), it sets the public attribute `follow_redirects = False`. A 3xx response becomes `ProviderError("bad_request")`, not transient, with `status_code` and `request_id` only. `Location`, the body and `Retry-After` are not copied. No public interface or dependency changes.
 - `httpx2` is used by tests (mock transport) and named in the type hint; it is already locked as a transitive dependency of `openai` (F2). Using it for this module is approved; declaring it directly is a separate future improvement (PC-01), not a requirement of this slice.
 
 Request body, one `responses.with_raw_response.create` call per `create`:
@@ -746,6 +748,14 @@ Changes applied in this revision (documentation only):
 3. Privacy statements corrected (G7, G14 table, Security). `request_id` is the only header value copied (G3); plan AG30 and AG32 aligned.
 4. Slice order unified in spec and plan: A types and adapter, B session and instructions, C loop, outcomes and diagnostics, D offline integration, E opt-in real evaluation. Use of the locked transitive `httpx2` approved; PC-01 is a future improvement.
 5. Q-01 to Q-06 recorded as approved; Q-07 scoped to the real evaluation and validated-integration claims.
+
+## Review 07-02-R1
+
+Clarification applied after the slice A implementation. It changes no interface, no dependency and no other rule.
+
+1. Redirects are never followed or repeated. A 3xx response maps to `bad_request`, not transient (G3 table, G4 bullet). Location, body and `Retry-After` are not exposed.
+2. B3 and B6 also apply to non-scalar values. A `failed` body whose `error.code` is a list or an object gives `provider_failed`, not transient. An `incomplete_details.reason` that is a list or an object gives `incomplete_reason "other"`. An `incomplete_details` that is not an object stays invalid.
+3. Plan AG24 aligned with C1/I1. Plan regressions AG119–AG121 added to slice A.
 
 ## Implementation Plan
 

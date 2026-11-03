@@ -56,7 +56,7 @@ Test helpers (inside `test_openai_provider.py`): `recording_transport(responses)
 | AG21 | `status "failed"` with `error.code "server_error"` → `ProviderError(provider_failed, transient=True)`; with `"invalid_prompt"` → `transient=False`. |
 | AG22 | `status` `null`, `"in_progress"`, `"queued"`, `"cancelled"`, `"unknown"` → `response_invalid`. |
 | AG23 | Output item types `web_search_call`, `custom_tool_call`, `mcp_call`, `future_item` → `response_invalid`; assistant message with a part type `future_part` → `response_invalid`. |
-| AG24 | `function_call` with missing or empty `call_id`, non-string `arguments`, `caller {"type": "program"}`, `namespace` set, `status "incomplete"` → `response_invalid`. Empty `name` and non-JSON `arguments` are accepted and returned unchanged (the loop sends them to `execute_tool`). |
+| AG24 | `function_call` with missing or empty `call_id`, non-string `arguments`, `caller {"type": "program"}`, `namespace` set, or a `status` outside C1 (for example `"done"`, `5`) → `response_invalid`. `status "incomplete"` or `"in_progress"` is not invalid: it follows C1/I1 (as AG105). The response becomes `status "incomplete"`, `incomplete_reason "item_incomplete"`, and the call is never executable (V1). Empty `name` and non-JSON `arguments` are accepted and returned unchanged (the loop sends them to `execute_tool`). (Aligned in review 07-02-R1.) |
 | AG25 | Status matrix, one HTTP request each: 400 → `bad_request`/no, 401 → `authentication`/no, 403 → `permission`/no, 404 → `model_unavailable`/no, 408 → `server_error`/yes, 409 → `server_error`/yes, 422 → `bad_request`/no, 429 (no code) → `rate_limited`/yes, 500 and 503 → `server_error`/yes, 418 → `bad_request`/no. |
 | AG26 | 429 with `code` or `type` `insufficient_quota`, `credit_balance_exhausted`, `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`, `organization_usage_limit_exceeded` → `quota`, not transient; 429 `slow_down` → `rate_limited`, transient. |
 | AG27 | 400 with `code "model_not_found"` → `model_unavailable`. |
@@ -81,8 +81,13 @@ Test helpers (inside `test_openai_provider.py`): `recording_transport(responses)
 | AG106 | Raw preservation (T1): for a reasoning item with `encrypted_content` and an unknown future key, a message with `phase` and `annotations`, and a function call with `id` and `status`, `raw` equals the literal canonical JSON of the item as written in the HTTP body (key order and unknown keys kept), and the next request body resends the same objects. |
 | AG107 | `item_size_bytes` and `static_size_bytes` (spec G10b) against literal byte counts: ASCII, `"ç"` (2 bytes), `"🎸"` (4 bytes), a `FunctionCallOutput` counting `call_id` plus `output`, a `raw` of 200,000 bytes; `static_size_bytes` equals the independent `len(...encode("utf-8"))` of literal instructions plus the literal compact JSON of the tools. |
 | AG108 | Item constructors reject a lone surrogate (`"\ud800"`) or a non-`str` in every text field with `ValueError` and a fixed message without the value. |
+| AG119 | (Review 07-02-R1, B3.) `status "failed"` with `error.code` a list or an object (`["server_error"]`, `{"value": "server_error"}`, `[]`, `{}`), `true` or `1.5` → `provider_failed`, not transient, no chained exception. `"server_error"` and `"rate_limit_exceeded"` stay transient. A missing `code` stays not transient. |
+| AG120 | (Review 07-02-R1, B6.) `status "incomplete"` with `incomplete_details.reason` a list or an object (`["max_output_tokens"]`, `{"value": …}`, `[]`, `{}`), `true` or `1.5` → `status "incomplete"`, `incomplete_reason "other"`, response accepted. A non-object `incomplete_details` stays `response_invalid` (AG99). |
+| AG121 | (Review 07-02-R1, redirects.) 301, 302, 303, 307 and 308 with `Location` to another host, `x-should-retry: true` and `retry-after` → exactly one request and the target never requested. Result: `ProviderError(bad_request)`, not transient, `status_code` kept, `request_id` from `x-request-id`, `retry_after_seconds None`. Location, body, fake `sk-` and key appear in no public surface. Covered for a supplied `httpx2.Client(follow_redirects=True)`, for a supplied `openai.DefaultHttpxClient` (SDK default configuration), and for the client the adapter builds when no `http_client` is given (`openai.DefaultHttpxClient` replaced in the test by a subclass that only injects `MockTransport`). The client is closed after `close()`. The adapter-built client keeps the 30 s timeout and answers a normal request. |
 
 Expected RED: AG01–AG36 and AG97–AG108 fail on import (modules absent). Possibly born green after `provider.py` exists but before the adapter: none planned. Contract-type checks in `test_provider_contract.py` (frozen dataclasses, `Protocol` conformance of a minimal scripted provider) are listed under AG01/AG08 and fail on import.
+
+Review 07-02-R1 regressions AG119–AG121 were added after the slice A implementation. Their RED is recorded against the slice A code (report 07-01), not as an import failure.
 
 Gates: slice tests; full `pytest -q -rs` (expect 1701 + new passed, same 2 skips); `ruff check --no-cache .`; `ruff format --check --no-cache .`. Mutations (scratchpad script, byte restore and SHA-256 check): `max_retries` default left at 2; `store=True`; `parallel_tool_calls` omitted; `raw` built from `output_text` only; `encrypted_content` dropped; 429 quota classified transient; error message copied from the SDK; `.parse()` used instead of the raw body; `bool` accepted as a usage integer; invalid usage reported as zero; message `status "incomplete"` accepted as final; `phase` dropped from `raw`; a header other than `x-request-id` copied.
 
@@ -235,6 +240,7 @@ Output: model names, statuses, counts, codes, durations and token numbers and re
 | G3 (errors, `request_id` exception) | AG25–AG36 | A |
 | G4b (response validation, HTTP 200 bodies) | AG97–AG106 | A |
 | G2 item constructors, G10b size functions | AG107–AG108 | A |
+| G3, G4, G4b review 07-02-R1 (non-scalar `error.code`/`reason`, redirects) | AG119–AG121 | A |
 | G6, G12 (history, identity) | AG67–AG80 | B |
 | G13 (instructions) | AG81–AG83 | B |
 | G5 (protocol, phase) | AG37–AG50, AG114 | C |
