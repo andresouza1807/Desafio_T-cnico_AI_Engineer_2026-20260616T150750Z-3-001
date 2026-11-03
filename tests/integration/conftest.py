@@ -995,3 +995,104 @@ def orders_kit():
         corrupt=orders_corrupt,
         observe=OrdersObserver,
     )
+
+
+# --- Slice 06 part A: typed agent tools -------------------------------------------------
+# docs/plans/06-tools.md, "Shared fixture (tools_kit)". Append-only block. It imports
+# emporio_agent.tools lazily inside the helpers, so the collection of every earlier test
+# module never depends on the tools module. The spy delegates to the real
+# connect_readonly; it observes opens and closure and never changes a result.
+
+TOOLS_FIXED = ORDERS_FIXED
+
+# Variant specs_nan: same "check" technique as the catalog variants above. Preparation
+# rejects non-finite constants, so only a hand-damaged database can hold this value.
+_CATALOG_VARIANTS["specs_nan"] = (
+    "check",
+    "products",
+    "specs_json",
+    '{"x": NaN}',
+    "product_id = ?",
+    (202,),
+)
+
+
+def _tools_fixed_clock() -> datetime:
+    return TOOLS_FIXED
+
+
+def _tools_strict_constant(name: str) -> object:
+    raise AssertionError(f"non-finite constant in payload: {name}")
+
+
+def tools_run(name, arguments, context):
+    """Call execute_tool; return the execution and an independent strict parse of it."""
+    import json
+    from importlib import import_module
+
+    execution = import_module("emporio_agent.tools").execute_tool(name, arguments, context)
+    return execution, json.loads(execution.payload, parse_constant=_tools_strict_constant)
+
+
+@dataclass
+class ConnectSpy:
+    opens: int = 0
+    connections: list[sqlite3.Connection] = field(default_factory=list)
+
+    def all_closed(self) -> bool:
+        for connection in self.connections:
+            try:
+                connection.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                continue
+            return False
+        return True
+
+
+def tools_connect_spy(monkeypatch) -> ConnectSpy:
+    """Wrap connect_readonly in emporio_agent.tools only; count opens, keep connections."""
+    from contextlib import contextmanager
+    from importlib import import_module
+
+    from emporio_agent.data.readonly import connect_readonly as real_connect
+
+    spy = ConnectSpy()
+
+    @contextmanager
+    def observed(database_path):
+        spy.opens += 1
+        with real_connect(database_path) as connection:
+            spy.connections.append(connection)
+            yield connection
+
+    monkeypatch.setattr(import_module("emporio_agent.tools"), "connect_readonly", observed)
+    return spy
+
+
+@pytest.fixture
+def tools_kit(tmp_path):
+    """Context builder, runner and connection spy for the tool tests."""
+    from importlib import import_module
+
+    absent_dir = tmp_path / "pasta-ausente-t6w"
+
+    def context(database_path=None, policy_index_path=None, customer=None, clock=None):
+        tools = import_module("emporio_agent.tools")
+        if database_path is None:
+            database_path = absent_dir / "ausente.sqlite3"
+        if policy_index_path is None:
+            policy_index_path = absent_dir / "ausente-indice.json"
+        return tools.ToolContext(
+            database_path=database_path,
+            policy_index_path=policy_index_path,
+            clock=_tools_fixed_clock if clock is None else clock,
+            customer=customer,
+        )
+
+    return SimpleNamespace(
+        FIXED=TOOLS_FIXED,
+        ABSENT_DIR=absent_dir,
+        context=context,
+        run=tools_run,
+        connect_spy=tools_connect_spy,
+    )
