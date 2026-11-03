@@ -1,8 +1,9 @@
 """Reading and validation of the store CSV files.
 
-This module currently holds the single-table reader of task T3. It checks file
-structure and single fields only; key uniqueness, references and database
-construction belong to later tasks. See docs/specs/02-04-csv-reading.md.
+This module holds the single-table reader of task T3 (structure and single fields,
+docs/specs/02-04-csv-reading.md) and the in-memory validation of keys and
+references across the six tables of task T4 (docs/specs/02-05-data-relations.md).
+Database construction belongs to a later task.
 """
 
 import csv
@@ -26,7 +27,7 @@ from emporio_agent.data.parsing import (
     parse_percent_basis_points,
     parse_text,
 )
-from emporio_agent.data.schema import SOURCE_FILE_PREFIX, ColumnSpec, FieldKind, TableSpec
+from emporio_agent.data.schema import SOURCE_FILE_PREFIX, TABLES, ColumnSpec, FieldKind, TableSpec
 
 type FieldValue = int | str | None
 
@@ -181,3 +182,91 @@ def read_table(
         row_count=len(records),
     )
     return TableReading(source=source, records=records)
+
+
+def _position(table: TableSpec, column_name: str) -> int:
+    for index, column in enumerate(table.columns):
+        if column.column_name == column_name:
+            return index
+    raise LookupError(f"unknown column in schema metadata for {table.name}")
+
+
+def _check_unique_keys(table: TableSpec, reading: TableReading) -> None:
+    """Raise duplicate_key at the first record that repeats a key value.
+
+    Keys are checked per record: primary key first, then each unique column. The
+    reported column is the last key column. Values are compared exactly.
+    """
+    keys = [table.primary_key, *((name,) for name in table.unique)]
+    checks = [
+        (
+            [_position(table, name) for name in key],
+            table.columns[_position(table, key[-1])].source_name,
+            set(),
+        )
+        for key in keys
+    ]
+    for record in reading.records:
+        for positions, column, seen in checks:
+            value = tuple(record.values[position] for position in positions)
+            if value in seen:
+                raise DataPreparationError(
+                    IssueCode.DUPLICATE_KEY,
+                    file_name=reading.source.file_name,
+                    line=record.line,
+                    column=column,
+                )
+            seen.add(value)
+
+
+def _check_references(
+    table: TableSpec, reading: TableReading, parent_keys: dict[str, frozenset[FieldValue]]
+) -> None:
+    """Raise broken_reference at the first value absent from its parent key index.
+
+    Records are checked in source order and, inside a record, in schema column order.
+    """
+    parents = {reference.column_name: reference.parent_table for reference in table.references}
+    checks = [
+        (position, column.source_name, parent_keys[parents[column.column_name]])
+        for position, column in enumerate(table.columns)
+        if column.column_name in parents
+    ]
+    for record in reading.records:
+        for position, column, keys in checks:
+            if record.values[position] not in keys:
+                raise DataPreparationError(
+                    IssueCode.BROKEN_REFERENCE,
+                    file_name=reading.source.file_name,
+                    line=record.line,
+                    column=column,
+                )
+
+
+def _primary_key_index(table: TableSpec, reading: TableReading) -> frozenset[FieldValue]:
+    # Only single-column parent keys are referenced (see TABLES).
+    if len(table.primary_key) != 1:
+        return frozenset()
+    position = _position(table, table.primary_key[0])
+    return frozenset(record.values[position] for record in reading.records)
+
+
+def read_validated_tables(
+    source_dir: Path, *, file_prefix: str = SOURCE_FILE_PREFIX
+) -> tuple[TableReading, ...]:
+    """Read the six source files in TABLE_ORDER and validate keys and references.
+
+    Each table is read with read_table, then checked for unique keys, then for
+    references to parent tables already validated, before the next file is read.
+    Readings are returned unchanged. No file is written and no database is opened.
+    See docs/specs/02-05-data-relations.md.
+    """
+    readings: list[TableReading] = []
+    parent_keys: dict[str, frozenset[FieldValue]] = {}
+    for table in TABLES:
+        reading = read_table(source_dir, table, file_prefix=file_prefix)
+        _check_unique_keys(table, reading)
+        _check_references(table, reading, parent_keys)
+        parent_keys[table.name] = _primary_key_index(table, reading)
+        readings.append(reading)
+    return tuple(readings)
