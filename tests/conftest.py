@@ -422,3 +422,129 @@ class PolicyKit:
 @pytest.fixture
 def policy_kit() -> PolicyKit:
     return PolicyKit()
+
+
+# --- Slice 04 part B: hand-built index and synthetic curated notes --------------------
+# docs/plans/04-policies.md, "Mini manual" (MINI_NOTES) and slice B (mini_index()).
+# Imports of production modules stay local to these builders, so a missing
+# emporio_agent.services.policies never blocks the collection of earlier test modules.
+
+# Fixed notice messages of spec P-11, written here by hand as the oracle.
+POLICY_NOTICE_MESSAGES: dict[str, str] = {
+    "contact_numbers_differ": (
+        "Phone and WhatsApp numbers differ between sections. Approved rule: general phone"
+        " from section 1.2, WhatsApp from section 7. Explain the origin if asked."
+    ),
+    "email_spelling_differs": (
+        "The e-mail address is spelled differently on page 1 and in section 1.2. Do not"
+        " correct it; report both origins if confirmation is requested and offer the"
+        " documented phone or WhatsApp."
+    ),
+    "installment_rules_differ": (
+        "Section 3 and section 3.1 differ on credit card installments. Approved rule:"
+        " prefer the ranges of section 3.1; other conditions need staff confirmation."
+    ),
+    "free_shipping_threshold_gap": (
+        "Section 5.1 defines orders above and below R$ 500,00 only. A total of exactly"
+        " R$ 500,00 is not defined and needs staff confirmation."
+    ),
+    "withdrawal_needs_channel_and_receipt_date": (
+        "Section 4.1 applies to online purchases and counts from actual receipt. Ask the"
+        " purchase channel and the actual receipt date when missing. An estimated delivery"
+        " date is not proof of receipt."
+    ),
+    "no_holiday_calendar": (
+        "The manual gives regular hours and closure on holidays, with no holiday calendar"
+        " or exception dates. Do not state a specific opening or next business day for an"
+        " uncertain date."
+    ),
+    "no_handoff_integration": (
+        "This system cannot open tickets, register complaints or forward requests. Guide"
+        " the customer to contact the store; never say a request was forwarded."
+    ),
+}
+
+# MINI_NOTES as plain data: (trigger, companion, only_for_concepts) and
+# (code, triggers, refers_to). Bound to a SHA-256 by mini_notes().
+MINI_COMPANIONS: tuple[tuple[str, str, frozenset[str]], ...] = (
+    ("3", "3.1", frozenset()),
+    ("3.1", "3", frozenset()),
+    ("4.2", "4.4", frozenset()),
+    ("1.1", "7", frozenset({"telefone", "whatsapp"})),
+    ("7", "1.1", frozenset({"telefone", "whatsapp"})),
+    ("1.1", "front_matter", frozenset({"email"})),
+    ("front_matter", "1.1", frozenset({"email"})),
+)
+MINI_NOTICES: tuple[tuple[str, frozenset[str], tuple[str, ...]], ...] = (
+    (
+        "contact_numbers_differ",
+        frozenset({"front_matter", "1.1", "7"}),
+        ("front_matter", "1.1", "7"),
+    ),
+    ("email_spelling_differs", frozenset({"front_matter", "1.1"}), ("front_matter", "1.1")),
+    ("installment_rules_differ", frozenset({"3", "3.1"}), ("3", "3.1")),
+    ("free_shipping_threshold_gap", frozenset({"5.1"}), ("5.1",)),
+    ("withdrawal_needs_channel_and_receipt_date", frozenset({"4.1"}), ("4.1",)),
+    ("no_holiday_calendar", frozenset({"2"}), ("2",)),
+    ("no_handoff_integration", frozenset({"7"}), ("7",)),
+)
+
+
+def mini_index(rows: Iterable[MiniRow] = MINI, source: dict[str, Any] | None = None) -> Any:
+    """PolicyIndex built by hand from MINI rows (no PDF, no file)."""
+    from emporio_agent.data.policy_index import IndexedSection, PolicyIndex, PolicySource
+
+    values = dict(MINI_SOURCE if source is None else source)
+    return PolicyIndex(
+        source=PolicySource(**values),
+        sections=tuple(
+            IndexedSection(section_id, level, title, parent_id, heading_page, tuple(lines))
+            for section_id, level, parent_id, title, heading_page, lines in rows
+        ),
+    )
+
+
+def mini_notes(
+    sha256: str = MINI_SOURCE["sha256"],
+    extra_companions: Iterable[tuple[str, str, frozenset[str]]] = (),
+) -> Any:
+    """MINI_NOTES bound to sha256, optionally with extra companion rules."""
+    from emporio_agent.services.policies import CompanionRule, CuratedNotes, NoticeRule
+
+    return CuratedNotes(
+        source_sha256=sha256,
+        companions=tuple(
+            CompanionRule(trigger, companion, only)
+            for trigger, companion, only in (*MINI_COMPANIONS, *extra_companions)
+        ),
+        notices=tuple(
+            NoticeRule(code, triggers, refers, POLICY_NOTICE_MESSAGES[code])  # type: ignore[arg-type]
+            for code, triggers, refers in MINI_NOTICES
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class PolicyRetrievalKit:
+    """Builders for slice B tests, exposed through a fixture (tests cannot import conftest)."""
+
+    messages: tuple[tuple[str, str], ...] = tuple(POLICY_NOTICE_MESSAGES.items())
+
+    @staticmethod
+    def index(rows: Iterable[MiniRow] = MINI, source: dict[str, Any] | None = None) -> Any:
+        return mini_index(rows, source)
+
+    @staticmethod
+    def notes(
+        sha256: str = MINI_SOURCE["sha256"],
+        extra_companions: Iterable[tuple[str, str, frozenset[str]]] = (),
+    ) -> Any:
+        return mini_notes(sha256, extra_companions)
+
+    def message(self, code: str) -> str:
+        return dict(self.messages)[code]
+
+
+@pytest.fixture
+def policy_retrieval() -> PolicyRetrievalKit:
+    return PolicyRetrievalKit()
