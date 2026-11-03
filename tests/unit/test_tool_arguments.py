@@ -89,7 +89,13 @@ def run(name, arguments, context):
 
 def test_tl01_registry_of_slice_a():
     first = tools().tool_names()
-    assert first == ("search_products", "get_product", "quote_product")
+    assert first == (
+        "search_products",
+        "get_product",
+        "quote_product",
+        "search_policies",
+        "get_order",
+    )
     assert type(first) is tuple
     assert tools().tool_names() == first
 

@@ -1095,4 +1095,55 @@ def tools_kit(tmp_path):
         context=context,
         run=tools_run,
         connect_spy=tools_connect_spy,
+        # Slice C.
+        policy_index=tools_policy_index,
+        index_spy=tools_index_spy,
     )
+
+
+# --- Slice 06 part C: policy index builder and index spy ------------------------------
+# docs/plans/06-tools.md, slice C. Append-only block. The index is built from a synthetic
+# PDF of policy_kit by the real prepare_policy_index; the spy delegates to the real
+# load_policy_index in emporio_agent.tools only and counts calls. Nothing here fakes an
+# index, a ranking or a result.
+
+TOOLS_POLICY_PDF_NAME = "manual-sintetico.pdf"
+TOOLS_POLICY_INDEX_DIR = "indice-politicas-r8m"
+TOOLS_POLICY_INDEX_NAME = "politicas.json"
+
+
+def tools_policy_index(policy_kit, directory: Path, edit=None) -> Path:
+    """Write the synthetic PDF under directory, prepare its index, return the index path.
+
+    The PDF stays at directory / TOOLS_POLICY_PDF_NAME so tests can hash its bytes.
+    """
+    from emporio_agent.data.policy_index import prepare_policy_index
+
+    directory.mkdir(parents=True, exist_ok=True)
+    source = policy_kit.write(directory, name=TOOLS_POLICY_PDF_NAME, edit=edit)
+    target_dir = directory / TOOLS_POLICY_INDEX_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / TOOLS_POLICY_INDEX_NAME
+    prepare_policy_index(source, target)
+    return target
+
+
+@dataclass
+class IndexSpy:
+    loads: int = 0
+
+
+def tools_index_spy(monkeypatch) -> IndexSpy:
+    """Wrap load_policy_index in emporio_agent.tools only; count calls, real loader."""
+    from importlib import import_module
+
+    from emporio_agent.data.policy_index import load_policy_index as real_load
+
+    spy = IndexSpy()
+
+    def observed(index_path):
+        spy.loads += 1
+        return real_load(index_path)
+
+    monkeypatch.setattr(import_module("emporio_agent.tools"), "load_policy_index", observed)
+    return spy

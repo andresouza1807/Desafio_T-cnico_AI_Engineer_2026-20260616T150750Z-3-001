@@ -20,9 +20,11 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from emporio_agent.data.parsing import SQLITE_MAX_INTEGER
+from emporio_agent.data.policy_index import PolicyIndexUnavailableError, load_policy_index
 from emporio_agent.data.preparation import SourceFileInfo
 from emporio_agent.data.readonly import DatabaseUnavailableError, connect_readonly
-from emporio_agent.services import catalog
+from emporio_agent.services import catalog, orders, policies
 from emporio_agent.services.catalog import (
     AppliedPromotion,
     CatalogInputError,
@@ -33,7 +35,13 @@ from emporio_agent.services.catalog import (
     Provenance,
     SearchResult,
 )
-from emporio_agent.services.orders import CustomerContext
+from emporio_agent.services.orders import (
+    CustomerContext,
+    OrderInputError,
+    OrderProvenance,
+    OrderView,
+)
+from emporio_agent.services.policies import PolicyInputError, PolicySearchResult
 
 type ToolStatus = Literal["ok", "not_found", "invalid_input", "unavailable", "internal_error"]
 
@@ -48,15 +56,24 @@ _DECIMAL_CONTEXT: Final = Context(prec=60)
 _NUMBER_CONTEXT: Final = Context(traps=[InvalidOperation])
 # Approved max_price_brl text (spec A6, G6), always applied with fullmatch.
 _BUDGET_PATTERN: Final = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]{1,2})?$")
+# Service notices that explain a policy not_found (spec G7): the first one is error.code.
+_POLICY_NOT_FOUND_CODES: Final = frozenset({"no_matching_section", "no_searchable_terms"})
 
 
 class _ToolFailure(Exception):
     """Internal signal: a fixed status, code and field. Never leaves this module."""
 
-    def __init__(self, status: ToolStatus, code: str, field: str | None = None) -> None:
+    def __init__(
+        self,
+        status: ToolStatus,
+        code: str,
+        field: str | None = None,
+        data: dict[str, object] | None = None,  # only search_policies not_found (G7)
+    ) -> None:
         self.status = status
         self.code = code
         self.field = field
+        self.data = data
         super().__init__(code)
 
 
@@ -111,6 +128,14 @@ class _GetProductArguments(_Arguments):
 class _QuoteProductArguments(_Arguments):
     product_id: int
     payment_method: str
+
+
+class _SearchPoliciesArguments(_Arguments):
+    query: str
+
+
+class _GetOrderArguments(_Arguments):
+    order_id: int
 
 
 # --- Serialization (spec G8, G9) ------------------------------------------------------
@@ -171,7 +196,7 @@ def _source(source: SourceFileInfo) -> dict[str, object]:
     }
 
 
-def _provenance(provenance: Provenance) -> dict[str, object]:
+def _provenance(provenance: Provenance | OrderProvenance) -> dict[str, object]:
     return {
         "prepared_at": provenance.prepared_at.isoformat(),
         "sources": [_source(source) for source in provenance.sources],
@@ -225,6 +250,61 @@ def _search_data(result: SearchResult) -> dict[str, object]:
     }
 
 
+def _policies_data(result: PolicySearchResult) -> dict[str, object]:
+    # matched_terms and the query are never returned (spec A7, G8, G14).
+    return {
+        "sections": [
+            {
+                "section_id": section.section_id,
+                "title": section.title,
+                "heading_path": list(section.heading_path),
+                "pages": list(section.pages),
+                "text": section.text,
+                "selected_by": section.selected_by,
+            }
+            for section in result.sections
+        ],
+        "omitted_section_ids": list(result.omitted_section_ids),
+        "notices": [
+            {
+                "code": notice.code,
+                "section_ids": list(notice.section_ids),
+                "message": notice.message,
+            }
+            for notice in result.notices
+        ],
+        "source": {
+            "file_name": result.source.file_name,
+            "sha256": result.source.sha256,
+            "page_count": result.source.page_count,
+        },
+    }
+
+
+def _order_data(order: OrderView) -> dict[str, object]:
+    # Only the approved order fields (spec A14, G8): no customer, notes, payment, order date.
+    estimate = order.estimated_delivery
+    return {
+        "order_id": order.order_id,
+        "status": order.status,
+        "items": [
+            {
+                "product_id": item.product_id,
+                "name": item.name,
+                "quantity": item.quantity,
+                "name_source": item.name_source,
+            }
+            for item in order.items
+        ],
+        "total": _two_places(order.total),
+        "tracking_code": order.tracking_code,
+        "estimated_delivery": None if estimate is None else estimate.isoformat(),
+        "estimate_status": order.estimate_status,
+        "business_date": order.business_date.isoformat(),
+        "provenance": _provenance(order.provenance),
+    }
+
+
 def _dumps(envelope: dict[str, object]) -> str:
     return json.dumps(envelope, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
@@ -241,7 +321,7 @@ def _envelope(
 
 
 def _failure(tool: str | None, failure: _ToolFailure) -> ToolExecution:
-    envelope = _envelope(tool, failure.status, None, failure.code, failure.field)
+    envelope = _envelope(tool, failure.status, failure.data, failure.code, failure.field)
     return ToolExecution(tool, failure.status, failure.code, _dumps(envelope))
 
 
@@ -293,6 +373,35 @@ def _run_quote_product(
     return _quote_data(quote)
 
 
+def _run_search_policies(
+    arguments: _SearchPoliciesArguments, context: ToolContext
+) -> dict[str, object]:
+    # The loader reads and closes the file before returning; loaded once per call (A7).
+    index = load_policy_index(context.policy_index_path)
+    result = policies.search_policies(index, arguments.query)  # approved default notes
+    data = _policies_data(result)
+    if result.status == "not_found":
+        code = next(n.code for n in result.notices if n.code in _POLICY_NOT_FOUND_CODES)
+        raise _ToolFailure("not_found", code, data=data)
+    return data
+
+
+def _run_get_order(arguments: _GetOrderArguments, context: ToolContext) -> dict[str, object]:
+    # Spec G4 steps 8b and 9 (G10): range, then session, both before any resource.
+    order_id = arguments.order_id
+    if not 1 <= order_id <= SQLITE_MAX_INTEGER:
+        raise _ToolFailure("invalid_input", "out_of_range", "order_id")
+    if context.customer is None:
+        raise _ToolFailure("unavailable", "order_not_accessible")
+    with connect_readonly(context.database_path) as connection:
+        order = orders.get_order(
+            connection, order_id, customer=context.customer, clock=context.clock
+        )
+    if order is None:  # missing or another customer's order: same answer (A4, A9)
+        raise _ToolFailure("unavailable", "order_not_accessible")
+    return _order_data(order)
+
+
 @dataclass(frozen=True)
 class _Tool:
     model: type[_Arguments]
@@ -303,6 +412,8 @@ _REGISTRY: Final[Mapping[str, _Tool]] = {
     "search_products": _Tool(_SearchProductsArguments, _run_search_products),
     "get_product": _Tool(_GetProductArguments, _run_get_product),
     "quote_product": _Tool(_QuoteProductArguments, _run_quote_product),
+    "search_policies": _Tool(_SearchPoliciesArguments, _run_search_policies),
+    "get_order": _Tool(_GetOrderArguments, _run_get_order),
 }
 
 
@@ -418,9 +529,9 @@ def execute_tool(name: str, arguments: str, context: ToolContext) -> ToolExecuti
         payload = _dumps(_envelope(name, "ok", data, None, None))
     except _ToolFailure as failure:
         return _failure(name, failure)
-    except CatalogInputError as error:
+    except (CatalogInputError, PolicyInputError, OrderInputError) as error:
         return _failure(name, _ToolFailure("invalid_input", error.code, error.field))
-    except DatabaseUnavailableError:
+    except DatabaseUnavailableError, PolicyIndexUnavailableError:
         return _failure(name, _ToolFailure("unavailable", "data_unavailable"))
     except Exception:
         return _failure(name, _ToolFailure("internal_error", "internal_error"))
