@@ -761,12 +761,226 @@ class ClockSpy:
         return self.value
 
 
+# --- Slice 05 part C: invalid rows and read observer ----------------------------------
+# docs/plans/05-orders.md, "Invalid-row variants" and "Read observer". Damage is applied
+# to a database built in the test's own tmp_path, with a separate writable connection,
+# before any connect_readonly. Only schema_v2 touches preparation_metadata.
+
+# variant: (technique, table, column, value, where clause, where parameters)
+# "check": PRAGMA ignore_check_constraints = ON, then one UPDATE.
+# "rebuild": table rebuilt without declared types or constraints, then one UPDATE.
+# "sql": one fixed statement with foreign_keys = OFF (column and value unused).
+_ORDERS_VARIANTS = {
+    "status_unknown": ("check", "orders", "status", "lost", "order_id = ?", (5001,)),
+    "total_negative": ("check", "orders", "total_cents", -1, "order_id = ?", (5001,)),
+    "total_text": ("rebuild", "orders", "total_cents", "SENTINEL-TOTAL", "order_id = ?", (5001,)),
+    "total_real": ("rebuild", "orders", "total_cents", 150000.5, "order_id = ?", (5001,)),
+    "tracking_blank": ("check", "orders", "tracking_code", "   ", "order_id = ?", (5001,)),
+    "tracking_int": ("rebuild", "orders", "tracking_code", 5001, "order_id = ?", (5001,)),
+    "estimate_month": (
+        "check",
+        "orders",
+        "estimated_delivery",
+        "2026-13-01",
+        "order_id = ?",
+        (5001,),
+    ),
+    "estimate_format": (
+        "check",
+        "orders",
+        "estimated_delivery",
+        "03/11/2026",
+        "order_id = ?",
+        (5001,),
+    ),
+    "estimate_int": (
+        "rebuild",
+        "orders",
+        "estimated_delivery",
+        20261103,
+        "order_id = ?",
+        (5001,),
+    ),
+    "quantity_zero": (
+        "check",
+        "order_items",
+        "quantity",
+        0,
+        "order_id = ? AND product_id = ?",
+        (5001, 10),
+    ),
+    "quantity_text": (
+        "rebuild",
+        "order_items",
+        "quantity",
+        "2",
+        "order_id = ? AND product_id = ?",
+        (5001, 10),
+    ),
+    "product_missing": ("sql", "DELETE FROM products WHERE product_id = ?", None, None, "", (11,)),
+    "name_blank": ("check", "products", "name", "   ", "product_id = ?", (10,)),
+    "foreign_status": ("check", "orders", "status", "SENTINEL-FOREIGN", "order_id = ?", (6001,)),
+    "drop_items": ("sql", "DROP TABLE order_items", None, None, "", ()),
+    "drop_orders": ("sql", "DROP TABLE orders", None, None, "", ()),
+    "schema_v2": (
+        "sql",
+        "UPDATE preparation_metadata SET value = ? WHERE key = ?",
+        None,
+        None,
+        "",
+        ("2", "schema_version"),
+    ),
+}
+
+
+def orders_corrupt(path: Path, variant: str) -> None:
+    """Store one damaged value (or drop one table) in a built database.
+
+    Runs before any read-only open, on the test's own file, with a separate writable
+    connection. Every UPDATE or DELETE must change exactly one row.
+    """
+    technique, table, column, value, where, parameters = _ORDERS_VARIANTS[variant]
+    connection = _catalog_writable(path)
+    try:
+        # Both PRAGMAs run before BEGIN: foreign_keys is a no-op inside a transaction.
+        connection.execute("PRAGMA foreign_keys = OFF")
+        if technique == "check":
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute("BEGIN")
+        try:
+            if technique == "sql":
+                cursor = connection.execute(table, parameters)
+                expected = -1 if table.startswith("DROP") else 1
+            else:
+                if technique == "rebuild":
+                    columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+                    names = ", ".join(columns)
+                    # No declared types, no constraints, no STRICT: values stored as given.
+                    connection.execute(f"CREATE TABLE {table}_untyped ({names})")
+                    connection.execute(
+                        f"INSERT INTO {table}_untyped ({names}) "
+                        f"SELECT {names} FROM {table} ORDER BY rowid"
+                    )
+                    connection.execute(f"DROP TABLE {table}")
+                    connection.execute(f"ALTER TABLE {table}_untyped RENAME TO {table}")
+                cursor = connection.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE {where}", (value, *parameters)
+                )
+                expected = 1
+            if cursor.rowcount != expected:
+                raise AssertionError(f"variant {variant} changed {cursor.rowcount} rows")
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
+
+
+# Authorizer action codes by name. Built from an explicit list: sqlite3 also exports
+# result codes (SQLITE_ERROR, ...) whose integer values collide with action codes.
+_AUTHORIZER_ACTION_NAMES = {
+    getattr(sqlite3, name): name
+    for name in (
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_CREATE_VTABLE",
+        "SQLITE_DELETE",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_DROP_VTABLE",
+        "SQLITE_FUNCTION",
+        "SQLITE_INSERT",
+        "SQLITE_PRAGMA",
+        "SQLITE_READ",
+        "SQLITE_RECURSIVE",
+        "SQLITE_REINDEX",
+        "SQLITE_SAVEPOINT",
+        "SQLITE_SELECT",
+        "SQLITE_TRANSACTION",
+        "SQLITE_UPDATE",
+    )
+    if hasattr(sqlite3, name)
+}
+
+
+@dataclass
+class ReadObservation:
+    """What SQLite reported while an observer was installed.
+
+    statements: one entry per executed statement, in order: (expanded SQL text from the
+    trace callback, authorizer events recorded while that statement was prepared). A
+    statement served from the connection's statement cache is traced with no events.
+    Events recorded without a following trace (a statement that failed to prepare) are
+    kept as a final entry with SQL None.
+    """
+
+    statements: list[tuple[str | None, tuple[tuple[str, str | None, str | None], ...]]] = field(
+        default_factory=list
+    )
+
+    @property
+    def events(self) -> list[tuple[str, str | None, str | None]]:
+        return [event for _sql, events in self.statements for event in events]
+
+
+class OrdersObserver:
+    """Context manager: real authorizer and trace callback on one connection.
+
+    The authorizer records (action, table, column) and always returns SQLITE_OK: it
+    observes, it never denies. Both callbacks are removed on exit, before assertions.
+    Nothing here changes or simulates a query result.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.observation = ReadObservation()
+        self._pending: list[tuple[str, str | None, str | None]] = []
+
+    def _authorizer(self, action, arg1, arg2, _database, _source):
+        self._pending.append((_AUTHORIZER_ACTION_NAMES.get(action, str(action)), arg1, arg2))
+        return sqlite3.SQLITE_OK
+
+    def _trace(self, statement: str) -> None:
+        self.observation.statements.append((statement, tuple(self._pending)))
+        self._pending.clear()
+
+    def __enter__(self) -> ReadObservation:
+        self.connection.set_authorizer(self._authorizer)
+        self.connection.set_trace_callback(self._trace)
+        return self.observation
+
+    def __exit__(self, *_exc_info) -> None:
+        self.connection.set_authorizer(None)
+        self.connection.set_trace_callback(None)
+        if self._pending:
+            self.observation.statements.append((None, tuple(self._pending)))
+            self._pending.clear()
+
+
 @pytest.fixture
 def orders_kit():
     """Builder, clock spy and independent readers for the order tests."""
     return SimpleNamespace(
         PREPARED_AT=ORDERS_PREPARED_AT,
         SOURCE_DIR=ORDERS_SOURCE_DIR,
+        DB_DIR=ORDERS_DB_DIR,
         DB_NAME=ORDERS_DB_NAME,
         FIXED=ORDERS_FIXED,
         INJECTION_NAME=ORDERS_INJECTION_NAME,
@@ -777,4 +991,7 @@ def orders_kit():
         query=catalog_query,
         snapshot=catalog_snapshot,
         ClockSpy=ClockSpy,
+        # Slice C.
+        corrupt=orders_corrupt,
+        observe=OrdersObserver,
     )

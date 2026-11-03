@@ -1,4 +1,4 @@
-"""Read-only, customer-scoped order lookup (Slice 05, parts A and B).
+"""Read-only, customer-scoped order lookup (Slice 05, parts A, B and C).
 
 Reads a prepared SQLite database through a connection opened by the caller with
 connect_readonly. Authorization is part of the SQL filter: one fixed statement binds the
@@ -9,8 +9,11 @@ through a join; item names are the current catalog names. The total is the store
 historical total, never recomputed from current prices.
 
 The caller owns the connection: this module never opens, closes or commits it and never
-changes its row_factory. Errors carry codes only. CustomerContext is a demonstration
-convention chosen by the application, not production authentication.
+changes its row_factory. Errors carry codes only: a SQLite failure in the order or
+items query becomes OrderDataError("query_failed") with the chain suppressed, except
+sqlite3.ProgrammingError (caller defect, for example a closed connection).
+CustomerContext is a demonstration convention chosen by the application, not
+production authentication.
 See docs/specs/05-orders.md.
 """
 
@@ -115,7 +118,7 @@ class OrderInputError(ValueError):
 
 
 class OrderDataError(Exception):
-    """A row read for the authorized order failed validation (invalid_row).
+    """An order query failed (query_failed) or a row read failed validation (invalid_row).
 
     Carries the reason only: no path, SQL, cell value or original message.
     args == (str(self),).
@@ -134,6 +137,20 @@ def _check_order_id(order_id: object) -> int:
     if not 1 <= order_id <= SQLITE_MAX_INTEGER:
         raise OrderInputError("order_id", "out_of_range")
     return order_id
+
+
+def _fetch(
+    connection: sqlite3.Connection, sql: str, parameters: tuple[object, ...]
+) -> list[tuple[object, ...]]:
+    # Own cursor with row_factory None; the caller's row_factory is never changed.
+    try:
+        cursor = connection.cursor()
+        cursor.row_factory = None
+        return cursor.execute(sql, parameters).fetchall()
+    except sqlite3.ProgrammingError:
+        raise
+    except sqlite3.Error:
+        raise OrderDataError("query_failed") from None
 
 
 def _business_date(clock: Callable[[], datetime]) -> date:
@@ -243,11 +260,10 @@ def get_order(
     if type(customer) is not CustomerContext:
         raise TypeError("customer must be a CustomerContext or None")
 
-    cursor = connection.cursor()
-    cursor.row_factory = None
-    row = cursor.execute(_ORDER_SQL, (order_id, customer.customer_id)).fetchone()
-    if row is None:
+    rows = _fetch(connection, _ORDER_SQL, (order_id, customer.customer_id))
+    if not rows:
         return None
+    row = rows[0]
 
     business_date = _business_date(clock)
     try:
@@ -255,7 +271,7 @@ def get_order(
     except TypeError, ValueError:  # FieldError is a ValueError
         raise OrderDataError("invalid_row") from None
 
-    item_rows = cursor.execute(_ITEMS_SQL, (order_id, customer.customer_id)).fetchall()
+    item_rows = _fetch(connection, _ITEMS_SQL, (order_id, customer.customer_id))
     try:
         items = tuple(_item(item_row) for item_row in item_rows)
     except TypeError, ValueError:
