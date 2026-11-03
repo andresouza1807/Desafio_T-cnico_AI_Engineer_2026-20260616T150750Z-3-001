@@ -1147,3 +1147,113 @@ def tools_index_spy(monkeypatch) -> IndexSpy:
 
     monkeypatch.setattr(import_module("emporio_agent.tools"), "load_policy_index", observed)
     return spy
+
+
+# --- Slice 06 part D: large synthetic catalog and order databases ----------------------
+# docs/plans/06-tools.md, slice D (big_catalog, big_order). Append-only block. Every value
+# is invented. Sources are written with write_sources and prepared with the real
+# prepare_database; nothing here fakes a query result, a size or persistence. Tests
+# compute every expected size from their own literal envelopes, never from this module.
+
+TOOLS_BIG_ORDER_C1 = 7001
+TOOLS_BIG_ORDER_C2 = 8001
+
+
+def tools_catalog_variant(base: Path, *, name_202=None, description_202=None) -> Path:
+    """catalog_kit sources with product 202 renamed or re-described, prepared under base."""
+    rows = catalog_rows()
+    index = next(i for i, row in enumerate(rows["products"]) if row[0] == "202")
+    if name_202 is not None:
+        set_cell(rows, "products", index, "name", name_202)
+    if description_202 is not None:
+        set_cell(rows, "products", index, "description", description_202)
+    source_dir = base / CATALOG_SOURCE_DIR
+    write_sources(source_dir, rows)
+    target_dir = base / CATALOG_DB_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / CATALOG_DB_NAME
+    prepare_database(source_dir, target, clock=lambda: CATALOG_PREPARED_AT)
+    return target
+
+
+def tools_big_catalog(base: Path, description_chars: int, char: str = "a", prefix: str = ""):
+    """Product 202 described by prefix + char * description_chars (slice D, TL62-TL63)."""
+    return tools_catalog_variant(base, description_202=prefix + char * description_chars)
+
+
+def tools_big_item_name(product_id: int) -> str:
+    return f"Item Sintético {product_id:04d}"
+
+
+def tools_big_item_quantity(product_id: int) -> int:
+    return product_id % 3 + 1
+
+
+def tools_big_order(base: Path, c1_items: int = 300, c2_items: int = 450) -> Path:
+    """Customer 1 owns order 7001 with products 1..c1_items; customer 2 owns order 8001
+    with products 1..c2_items. Item rows are written in descending product order, so a
+    sorted result proves the service order, not the CSV order."""
+    count = max(c1_items, c2_items)
+    rows = {
+        "categories": [["1", "Sintéticos", "Categoria de teste"]],
+        "customers": [
+            ["1", "Cliente Grande Um", "(00) 90000-0101", "grande-c1@example.invalid", "X"],
+            ["2", "Cliente Grande Dois", "(00) 90000-0102", "grande-c2@example.invalid", "Y"],
+        ],
+        "products": [
+            _orders_product(str(i), "1", tools_big_item_name(i), "10.00", "5", "active")
+            for i in range(1, count + 1)
+        ],
+        "promotions": [],
+        "orders": [
+            [
+                str(TOOLS_BIG_ORDER_C1),
+                "1",
+                "2026-10-28",
+                "shipped",
+                "100.00",
+                "pix",
+                "TRK-7001",
+                "2026-11-05",
+                "",
+            ],
+            [
+                str(TOOLS_BIG_ORDER_C2),
+                "2",
+                "2026-10-28",
+                "shipped",
+                "200.00",
+                "pix",
+                "TRK-8001",
+                "2026-11-05",
+                "",
+            ],
+        ],
+        "order_items": [
+            [str(order_id), str(tools_big_item_quantity(i)), str(i)]
+            for order_id, items in ((TOOLS_BIG_ORDER_C1, c1_items), (TOOLS_BIG_ORDER_C2, c2_items))
+            for i in range(items, 0, -1)
+        ],
+    }
+    source_dir = base / ORDERS_SOURCE_DIR
+    write_sources(source_dir, rows)
+    target_dir = base / ORDERS_DB_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / ORDERS_DB_NAME
+    prepare_database(source_dir, target, clock=lambda: ORDERS_PREPARED_AT)
+    return target
+
+
+@pytest.fixture
+def tools_big():
+    """Builders for the slice D size and replacement tests."""
+    return SimpleNamespace(
+        catalog=tools_big_catalog,
+        catalog_variant=tools_catalog_variant,
+        order=tools_big_order,
+        item_name=tools_big_item_name,
+        item_quantity=tools_big_item_quantity,
+        ORDER_C1=TOOLS_BIG_ORDER_C1,
+        ORDER_C2=TOOLS_BIG_ORDER_C2,
+        SOURCE_DIR=ORDERS_SOURCE_DIR,
+    )
