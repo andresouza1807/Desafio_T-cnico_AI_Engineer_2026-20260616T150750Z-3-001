@@ -1,0 +1,5 @@
+product_id,category_id,name,description,price_brl,stock_quantity,status,specs,created_at
+10,1,Violão Teste,"Tampo maciço, cordas de aço",599.9,3,active,"{""cor"": ""natural""}",2026-01-15
+11,1,Encordoamento Teste,Aço,19.90,0,active,{},2026-01-16
+12,2,Piano Teste,88 teclas,1200,2,discontinued,"{""teclas"": ""88""}",2025-12-01
+13,2,Teclado Teste,61 teclas,850.5,1,coming_soon,{},2026-03-01
