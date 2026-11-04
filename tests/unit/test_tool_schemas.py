@@ -53,6 +53,8 @@ EXPECTED = {
     "quote_product": {
         "product_id": ("integer", {"minimum": 1}),
         "payment_method": ("string", {"enum": ["regular", "pix"]}),
+        # Review 06-07-INSTALLMENTS: nullable count, 2 to 12.
+        "installments": (["integer", "null"], {"minimum": 2, "maximum": 12}),
     },
     "search_policies": {"query": ("string", {})},
     "get_order": {"order_id": ("integer", {"minimum": 1})},
@@ -123,6 +125,8 @@ def conforms(schema, value):
     if "enum" in schema and value not in schema["enum"]:
         return False
     if "pattern" in schema and re.search(schema["pattern"], value) is None:
+        return False
+    if "maximum" in schema and value > schema["maximum"]:
         return False
     return "minimum" not in schema or value >= schema["minimum"]
 
@@ -216,11 +220,14 @@ VALID = {
         "offset": 5,
     },
     "get_product": {"product_id": 1},
-    "quote_product": {"product_id": 1, "payment_method": "pix"},
+    "quote_product": {"product_id": 1, "payment_method": "pix", "installments": None},
     "search_policies": {"query": "frete"},
     "get_order": {"order_id": 1},
 }
-NULLABLE = {"search_products": {"query", "category", "max_price_brl"}}
+NULLABLE = {
+    "search_products": {"query", "category", "max_price_brl"},
+    "quote_product": {"installments"},
+}
 
 
 def run(name, arguments, ctx):
@@ -264,7 +271,12 @@ def test_tl69_provider_valid_samples_reach_the_resource(tmp_path):
             },
         ),
         ("search_products", {**VALID["search_products"], "max_price_brl": "0"}),
-        ("quote_product", {"product_id": 2**63 - 1, "payment_method": "regular"}),
+        (
+            "quote_product",
+            {"product_id": 2**63 - 1, "payment_method": "regular", "installments": None},
+        ),
+        ("quote_product", {"product_id": 1, "payment_method": "regular", "installments": 12}),
+        ("quote_product", {"product_id": 1, "payment_method": "regular", "installments": 2}),
     ]
     for name, sample in samples:
         assert conforms(schema[name]["parameters"], sample), (name, sample)

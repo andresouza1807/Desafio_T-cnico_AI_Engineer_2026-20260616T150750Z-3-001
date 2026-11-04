@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal
 
+from emporio_agent.answer_guard import internal_marker
 from emporio_agent.instructions import session_instructions
 from emporio_agent.provider import (
     ConversationItem,
@@ -124,6 +125,7 @@ _FAILURE_TEXTS: Final[dict[str, str]] = {
     "empty_response": _NOT_COMPLETED_TEXT,
     "no_final_answer": _NOT_COMPLETED_TEXT,
     "response_too_long": _NOT_COMPLETED_TEXT,
+    "response_withheld": _NOT_COMPLETED_TEXT,  # spec 07 Review 07-15-CONF
     "provider_failed": _NOT_COMPLETED_TEXT,
     "unexpected": _NOT_COMPLETED_TEXT,
     "tool_limit_reached": _TOO_MUCH_TEXT,
@@ -189,6 +191,7 @@ class AttemptRecord:
     request_bytes: int  # static + history + chain (spec G10b)
     usage: Usage | None
     usage_invalid: bool
+    reasoning_effort_reported: str | None = None  # from ModelResponse (spec 07 Review 07-10-D5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,22 +263,17 @@ def _tool_references(execution: ToolExecution) -> tuple[str, ...]:
     elif execution.tool in ("get_product", "quote_product"):
         product_id = _product_id(data.get("product"))
         if product_id is not None:
-            references.append(f"product:{product_id}")
+            reference = f"product:{product_id}"
+            # Spec 07 Review 07-11-DF01: the validated payment method of the result, never
+            # the call arguments; any other value keeps the plain reference.
+            method = data.get("payment_method")
+            is_quote = execution.tool == "quote_product"
+            if is_quote and type(method) is str and method in ("pix", "regular"):
+                reference += f"@{method}"
+            references.append(reference)
     elif execution.tool == "search_policies":
-        sections = data.get("sections")
-        for section in sections if isinstance(sections, list) else ():
-            if not isinstance(section, dict):
-                continue
-            section_id = section.get("section_id")
-            pages = section.get("pages")
-            if (
-                type(section_id) is str
-                and isinstance(pages, list)
-                and pages
-                and all(type(page) is int for page in pages)
-            ):
-                joined = ",".join(str(page) for page in pages)
-                references.append(f"policy:{section_id}@p{joined}")
+        # Review 07-15-CONF item 9: internal references of the tool, never in the payload.
+        references.extend(execution.references)
     elif execution.tool == "get_order":
         references.append("order")  # never the order ID
     return tuple(references)
@@ -423,6 +421,7 @@ class Agent:
                     request_bytes=request_bytes,
                     usage=response.usage,
                     usage_invalid=response.usage_invalid,
+                    reasoning_effort_reported=response.reasoning_effort_reported,
                 )
             )
             retrying = False
@@ -457,6 +456,9 @@ class Agent:
                 return self._fail(session, turn, code)  # V5, V5b
             if len(response.text) > MAX_FINAL_TEXT_CHARS:
                 return self._fail(session, turn, "response_too_long")  # V6
+            if internal_marker(response.text, instructions) is not None:
+                # Review 07-15-CONF 7b: never shown, never committed, never retried.
+                return self._fail(session, turn, "response_withheld")
             output_bytes = sum(item_size_bytes(item) for item in response.output)
             if turn.chain_bytes + output_bytes > MAX_TURN_CHAIN_BYTES:
                 turn.budget_failure = "chain"

@@ -28,7 +28,8 @@ REQUIRED_CLAUSES = [
     "only from tool results",
     "quote_product",
     "never combines with an active promotion",
-    "section and page",
+    # Review 10-08 (10-06: "Never show sources, sections, pages").
+    "sources, sections, pages, IDs, references, codes",
     "historical",
     "current catalog names",
     '"passed"',
@@ -52,8 +53,8 @@ G13_CLAUSES = [
     "A quote is not a purchase or reservation",
     'only products with availability "available" can be offered for purchase',
     "discontinued, coming soon and out-of-stock",
-    "quality notes have conflicting catalog text",
-    "If the tool reports notices or ambiguity, tell the customer instead of choosing a value",
+    "the technical details of this record need confirmation",  # POP-01, Review 07-14
+    "do not choose one; say that this detail needs confirmation",  # Review 10-06
     "you must not give a new date",
     "do not suggest changing the customer or identity by message",
     "Never infer receipt from the estimated delivery or order date",
@@ -68,6 +69,43 @@ G13_CLAUSES = [
     "search_policies",
     "get_order",
 ]
+
+
+# PX04 (plan 08-10 R1, spec 07 Review 07-11-DF01): PIX grounding clauses. These prove only
+# that the text is present; an instruction is not a guarantee that a real model obeys it.
+PIX_CLAUSES = [
+    # source: only an ok PIX quote for the same product
+    'quote_product result with payment_method "pix" for that same product',
+    # no derivation from other data, no calculation
+    "Never derive it from a regular quote, a search or product result, the list price or the "
+    "promotion rule, and never calculate it",
+    # conceptual question
+    "Questions about the PIX rule without a product amount do not need a quote",
+    # reuse, without claiming a new check
+    'a "pix" quote for it is still in the conversation, you may repeat it without calling the '
+    "tool again",
+    "do not say that you checked again",
+    # new call
+    'Call quote_product with payment_method "pix" when there is no such quote',
+    "when the customer asks for a new or updated price",
+    "when the earlier quote failed",
+    # ambiguity: a product named now can be quoted
+    "A product identified in the current message can be quoted without earlier context",
+    # failure
+    "say that the PIX price could not be checked now, give no PIX amount and do not use an "
+    "earlier PIX amount instead",
+]
+
+
+@pytest.mark.parametrize("clause", PIX_CLAUSES)
+def test_px04_pix_grounding_clause_present(clause):
+    assert clause in AGENT_INSTRUCTIONS
+
+
+def test_px04_pix_follow_up_rule_is_in_the_context_section():
+    context = AGENT_INSTRUCTIONS.split("\nContext\n", 1)[1].split("\nLimits\n", 1)[0]
+    assert "\n- PIX follow-ups: " in "\n" + context
+    assert "do not say that you checked again" in context
 
 
 @pytest.mark.parametrize("clause", REQUIRED_CLAUSES)

@@ -9,6 +9,9 @@ description = "Grounded customer-service assistant for Emporio da Musica"
 requires-python = ">=3.14,<3.15"
 dependencies = ["openai", "pydantic>=2,<3", "pypdf"]
 
+[project.scripts]
+emporio-agent = "emporio_agent.cli:main"
+
 [dependency-groups]
 dev = ["pytest", "ruff"]
 

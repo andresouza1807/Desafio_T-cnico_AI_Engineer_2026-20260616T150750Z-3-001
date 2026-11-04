@@ -210,6 +210,7 @@ def quote_201_pix_payload(base: Path) -> str:
         "discount_source": "pix",
         "promotion": None,
         "pix_not_combined": False,
+        "installments": None,
         "provenance": catalog_provenance(base),
     }
     return compact({"tool": "quote_product", "status": "ok", "data": data, "error": None})
@@ -383,7 +384,7 @@ def test_ag94_sdk_round_trip_preserves_reasoning_call_and_real_output(
             (2, "response", SNAPSHOT, "req_2"),
         ]
         assert diagnostics.configured_model == MODEL
-        assert [r.references for r in diagnostics.tool_runs] == [("product:201",)]
+        assert [r.references for r in diagnostics.tool_runs] == [("product:201@pix",)]
         assert (diagnostics.input_tokens_reported, diagnostics.output_tokens_reported) == (240, 60)
 
         # The retained turn is resent by the SDK on the next message, unchanged.
@@ -476,7 +477,7 @@ def test_ag118_chain_over_budget_before_next_attempt_sends_no_more_http(greeted,
     # Exactly the one request of attempt 1; no request for the attempt that did not fit.
     assert len(transport.requests) == sent_before + 1
     assert transport.bodies == []
-    assert [a.request_bytes for a in result.diagnostics.attempts] == [6_711 + 142 + 5]
+    assert [a.request_bytes for a in result.diagnostics.attempts] == [12_732 + 142 + 5]
     # The tool of the response that fitted did run once, with the real envelope.
     assert calls == [("search_products", SEARCH_ARGS, search_violoes_payload(catalog_base))]
     sent = transport.sent(sent_before)

@@ -1483,3 +1483,233 @@ def test_ag106_raw_preservation_and_resend():
         + json.dumps(payload, ensure_ascii=False)
         + "}",
     ]
+
+
+# --- AG122-AG124: optional reasoning effort (spec G4, review 07-07-R1) ----------------------
+# None omits the reasoning configuration; "none" would request effort none explicitly and is
+# out of this revision's scope (not equivalent to None). Oracles are literal bodies.
+
+_EFFORTS = ["low", "medium", "high", "xhigh"]
+_AG06_BODY = {
+    "model": "gpt-5.4-mini",
+    "instructions": "Responda em português.",
+    "input": [{"type": "message", "role": "user", "content": "Quanto custa o violão?"}],
+    "tools": [TOOL],
+    "tool_choice": "auto",
+    "parallel_tool_calls": False,
+    "store": False,
+    "max_output_tokens": 8000,
+}
+
+
+class _EffortText(str):
+    """A str subclass: rejected, the type must be exactly str."""
+
+
+_BAD_EFFORTS = [
+    "none",
+    "minimal",
+    "max",
+    "",
+    " low",
+    "low ",
+    "LOW",
+    "Low",
+    "SENTINEL-EFFORT",
+    True,
+    1,
+    b"low",
+    ["low"],
+    {"effort": "low"},
+    _EffortText("low"),
+]
+
+
+def test_ag122_allowed_efforts_constant():
+    import emporio_agent.openai_provider as adapter
+
+    assert getattr(adapter, "REASONING_EFFORTS", None) == ("low", "medium", "high", "xhigh")
+
+
+def test_ag122_explicit_none_keeps_the_ag06_body():
+    transport = Transport(reply(envelope()))
+    with make(transport, reasoning_effort=None) as provider:
+        provider.create(request(UserMessage("Quanto custa o violão?")))
+    body = transport.body()
+    assert body == _AG06_BODY
+    assert "reasoning" not in body and "include" not in body
+
+
+@pytest.mark.parametrize("effort", _EFFORTS)
+def test_ag122_each_effort_adds_only_reasoning_effort(effort):
+    transport = Transport(reply(envelope()), reply(envelope()))
+    with make(transport, reasoning_effort=effort) as provider:
+        provider.create(request(UserMessage("Quanto custa o violão?")))
+        provider.create(request(UserMessage("Quanto custa o violão?"), allow=False))
+    assert transport.body(0) == _AG06_BODY | {"reasoning": {"effort": effort}}
+    assert transport.body(1) == _AG06_BODY | {
+        "tool_choice": "none",
+        "reasoning": {"effort": effort},
+    }
+    for index in (0, 1):
+        assert "include" not in transport.body(index)
+
+
+@pytest.mark.parametrize("value", _BAD_EFFORTS, ids=repr)
+def test_ag123_invalid_effort_rejected_without_echo_and_client_closed(value):
+    client = httpx2.Client(transport=httpx2.MockTransport(Transport()))
+    with pytest.raises(ValueError) as info:
+        OpenAIResponsesProvider(
+            api_key=KEY, model=MODEL, reasoning_effort=value, http_client=client
+        )
+    message = str(info.value)
+    assert client.is_closed
+    assert message == "reasoning_effort must be None or one of the supported effort values"
+    assert "SENTINEL" not in message and KEY not in message
+
+
+def test_ag123_effort_checked_after_the_other_arguments():
+    with pytest.raises(ValueError) as info:
+        OpenAIResponsesProvider(api_key=" ", model=MODEL, reasoning_effort="none")
+    assert str(info.value) == "api_key must be a non-blank str without surrounding whitespace"
+
+
+def test_ag124_repr_and_model_unchanged_with_effort():
+    with make(Transport(), reasoning_effort="high") as provider:
+        assert provider.model == MODEL
+        assert repr(provider) == "OpenAIResponsesProvider(model='gpt-5.4-mini')"
+        assert "high" not in repr(provider)
+
+
+def test_ag124_reasoning_received_and_resent_unchanged_with_effort():
+    rich_reasoning = (
+        '{"type":"reasoning","id":"rs_e1","summary":[],"encrypted_content":"gAAAAB-EFFORT+/==",'
+        '"status":"completed","future_key":{"kept":true}}'
+    )
+    first = envelope(output_of(rich_reasoning, CALL))
+    transport = Transport(reply(first), reply(envelope()))
+    with make(transport, reasoning_effort="low") as provider:
+        result = provider.create(request(UserMessage("Preço do 211?")))
+        assert result.output[0] == ProviderItem(kind="reasoning", raw=rich_reasoning)
+        payload = '{"status":"ok","data":{"product_id":211}}'
+        provider.create(
+            request(
+                UserMessage("Preço do 211?"),
+                *result.output,
+                FunctionCallOutput(call_id="call_1", output=payload),
+            )
+        )
+    second = transport.body(1)
+    assert second["reasoning"] == {"effort": "low"}
+    compact = [
+        json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in second["input"]
+    ]
+    assert compact[1:3] == [rich_reasoning, CALL]
+    assert second["input"][3] == {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": payload,
+    }
+
+
+# --- RM01-RM05: reported reasoning effort (spec 07 Review 07-10-D5, rule B8) --------------
+
+_REPORTED = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def test_rm01_reported_efforts_constant_matches_the_sdk_literal():
+    import typing
+
+    from openai.types.shared.reasoning_effort import ReasoningEffort
+
+    import emporio_agent.openai_provider as adapter
+
+    assert adapter.REPORTED_REASONING_EFFORTS == _REPORTED
+    sdk_values = {
+        value for arg in typing.get_args(ReasoningEffort) for value in typing.get_args(arg)
+    }
+    assert set(adapter.REPORTED_REASONING_EFFORTS) == sdk_values
+    # Requested values stay a separate, narrower constant (AG122).
+    assert adapter.REASONING_EFFORTS == ("low", "medium", "high", "xhigh")
+
+
+@pytest.mark.parametrize("effort", _REPORTED)
+def test_rm02_each_reported_effort_is_extracted(effort):
+    reasoning_json = '{"effort":"' + effort + '","summary":null,"context":"all_turns"}'
+    result = answer(envelope(extra=',"reasoning":' + reasoning_json))
+    assert result.reasoning_effort_reported == effort
+    assert result.text == "Olá! Como posso ajudar?"
+
+
+def test_rm03_reported_effort_differs_from_requested_effort():
+    transport = Transport(reply(envelope(extra=',"reasoning":{"effort":"medium","summary":null}')))
+    with make(transport, reasoning_effort="low") as provider:
+        result = provider.create(request(UserMessage("Quanto custa o violão?")))
+    assert transport.body()["reasoning"] == {"effort": "low"}
+    assert result.reasoning_effort_reported == "medium"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ["", ',"reasoning":null', ',"reasoning":{}', ',"reasoning":{"effort":null,"summary":null}'],
+    ids=["absent", "null", "no-effort", "effort-null"],
+)
+@pytest.mark.parametrize("requested", [None, "low"])
+def test_rm04_absent_effort_has_no_fallback(extra, requested):
+    transport = Transport(reply(envelope(extra=extra)))
+    with make(transport, reasoning_effort=requested) as provider:
+        result = provider.create(request())
+    assert result.reasoning_effort_reported is None
+
+
+_BASELINE = ModelResponse(
+    response_id="resp_1",
+    model=SNAPSHOT,
+    status="completed",
+    incomplete_reason=None,
+    output=(ProviderItem(kind="assistant_message", raw=MSG),),
+    text="Olá! Como posso ajudar?",
+    commentary_present=False,
+    refusal=False,
+    usage=Usage(
+        input_tokens=120,
+        output_tokens=30,
+        total_tokens=150,
+        cached_input_tokens=40,
+        reasoning_tokens=10,
+    ),
+    usage_invalid=False,
+    request_id=None,
+)
+
+
+@pytest.mark.parametrize(
+    "reasoning_json",
+    [
+        '"low"',
+        '["low"]',
+        "1",
+        "true",
+        '{"effort":1}',
+        '{"effort":true}',
+        '{"effort":["low"]}',
+        '{"effort":{"value":"low"}}',
+        '{"effort":"LOW"}',
+        '{"effort":"Low"}',
+        '{"effort":" low"}',
+        '{"effort":"low "}',
+        '{"effort":""}',
+        '{"effort":"SENTINEL-EFFORT x"}',
+        '{"effort":"\\u001b[31m"}',
+        '{"effort":"low\\nx"}',
+    ],
+)
+def test_rm05_invalid_metadata_is_ignored_and_the_answer_is_kept(reasoning_json):
+    result = answer(envelope(extra=',"reasoning":' + reasoning_json))
+    assert result == _BASELINE
+    assert result.reasoning_effort_reported is None
+    assert "SENTINEL" not in repr(result)
+
+
+def test_rm05_baseline_without_reasoning_equals_the_literal():
+    assert answer(envelope()) == _BASELINE

@@ -132,6 +132,9 @@ class ModelResponse:
     usage: Usage | None  # None when absent or invalid; never zero-filled
     usage_invalid: bool  # usage present but malformed
     request_id: str | None
+    # Effort reported in the response body (spec 07 B8, Review 07-10-D5). None = not reported
+    # or ignored as invalid; never filled with the requested or configured effort.
+    reasoning_effort_reported: str | None = None
 
 
 type ProviderErrorKind = Literal[

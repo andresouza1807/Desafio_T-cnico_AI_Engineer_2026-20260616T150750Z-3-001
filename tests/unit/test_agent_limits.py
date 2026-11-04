@@ -485,7 +485,8 @@ PAD_CALL_RAW = (
 PAD_CALL = FunctionCall("call_pad", "get_order", '{"order_id":1}', PAD_CALL_RAW)
 PAD_OUTPUT = FunctionCallOutput("call_pad", ORDER_NOT_ACCESSIBLE)  # 8 + 108 = 116
 # chain after one tool round = 9 + (68 + n + 2) + 130 + 116 = 325 + n
-STATIC_ANONYMOUS = 6_711  # session_instructions(False) + compact tool schemas, measured once
+# session_instructions(False) + compact tool schemas; report 10-10 (10-08: 12,295; 10-06: 11,853)
+STATIC_ANONYMOUS = 12_732
 
 
 def padded_reasoning(padding: str) -> ProviderItem:
@@ -544,13 +545,13 @@ def test_ag110_total_budget_exact_is_sent(kit: Kit, monkeypatch: pytest.MonkeyPa
     provider = ScriptedProvider(answer("ok"))
     result = kit.agent(provider).respond(ConversationSession(), "oi")
     assert result.outcome == "answered"
-    assert result.diagnostics.attempts[0].request_bytes == 6_713
+    assert result.diagnostics.attempts[0].request_bytes == 12_734
 
 
 def test_ag110_total_budget_minus_one_is_not_sent(
     kit: Kit, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(agent_module, "MAX_REQUEST_BYTES", 6_712)
+    monkeypatch.setattr(agent_module, "MAX_REQUEST_BYTES", 12_733)
     session = ConversationSession()
     provider = ScriptedProvider(answer("ok"))
 
@@ -573,21 +574,21 @@ def test_ag110_total_budget_minus_one_is_not_sent(
 SEEDED_HISTORY_BYTES = 2_978
 
 
-@pytest.mark.parametrize(("limit", "sent"), [(9_691, True), (9_690, False)])
+@pytest.mark.parametrize(("limit", "sent"), [(15_712, True), (15_711, False)])
 def test_ag110_total_budget_with_retained_history(
     kit: Kit, monkeypatch: pytest.MonkeyPatch, limit: int, sent: bool
 ) -> None:
     session = seeded_session()
     assert session.history_bytes == SEEDED_HISTORY_BYTES
     before = state(session)
-    monkeypatch.setattr(agent_module, "MAX_REQUEST_BYTES", limit)  # 6,711 + 2,978 + 2
+    monkeypatch.setattr(agent_module, "MAX_REQUEST_BYTES", limit)  # 10,789 + 2,978 + 2
     provider = ScriptedProvider(answer("ok"))
 
     result = kit.agent(provider).respond(session, "oi")
 
     if sent:
         assert result.outcome == "answered"
-        assert result.diagnostics.attempts[0].request_bytes == 9_691
+        assert result.diagnostics.attempts[0].request_bytes == 15_712
     else:
         assert (result.failure, result.diagnostics.budget_failure) == (
             "request_too_large",
@@ -663,7 +664,7 @@ def test_ag113_retry_keeps_request_and_size(kit: Kit) -> None:
     assert provider.calls == 3
     assert provider.requests[1] is provider.requests[2]
     sizes = [a.request_bytes for a in result.diagnostics.attempts]
-    assert sizes == [6_720, 268_855, 268_855]
+    assert sizes == [12_741, 274_876, 274_876]
     assert len(kit.spy.calls) == 1
     assert kit.sleeps == [1.0]
 
@@ -742,12 +743,12 @@ def test_ag115_static_budget_linked_session_literal(
 ) -> None:
     from emporio_agent.services.orders import CustomerContext
 
-    monkeypatch.setattr(agent_module, "MAX_STATIC_BYTES", 6_690)  # linked line is shorter
+    monkeypatch.setattr(agent_module, "MAX_STATIC_BYTES", 12_711)  # linked line is shorter
     provider = ScriptedProvider(answer("ok"))
     session = ConversationSession(customer=CustomerContext(1))
     result = kit.agent(provider).respond(session, "oi")
     assert result.outcome == "answered"
-    assert result.diagnostics.attempts[0].request_bytes == 6_692
+    assert result.diagnostics.attempts[0].request_bytes == 12_713
 
 
 def test_budget_never_prunes_history_at_request_time(kit: Kit) -> None:

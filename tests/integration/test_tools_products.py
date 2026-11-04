@@ -40,6 +40,7 @@ QUOTE_KEYS = [
     "discount_source",
     "promotion",
     "pix_not_combined",
+    "installments",  # Review 06-07-INSTALLMENTS
     "provenance",
 ]
 
@@ -626,6 +627,7 @@ def quote_data(summary, method, final, percent, source, promotion, not_combined,
         "discount_source": source,
         "promotion": promotion,
         "pix_not_combined": not_combined,
+        "installments": None,  # no count sent
         "provenance": provenance,
     }
 

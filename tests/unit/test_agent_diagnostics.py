@@ -95,6 +95,7 @@ def test_interface_dataclasses_have_the_contract_fields() -> None:
         "request_bytes",
         "usage",
         "usage_invalid",
+        "reasoning_effort_reported",  # RM06, spec 07 Review 07-10-D5
     ]
     assert _fields(TurnDiagnostics) == [
         "configured_model",
@@ -286,6 +287,18 @@ REFERENCE_CASES = [
     (_ok("search_products", {"products": []}), ()),
     (_ok("get_product", {"product": _product(201), "description": "product:7"}), ("product:201",)),
     (_ok("quote_product", {"product": _product(210), "final_price": "100.00"}), ("product:210",)),
+    # Review 10-06 (spec 07 Review 07-15-CONF item 9): policy references come only from
+    # ToolExecution.references; the payload carries no section ID or page.
+    (
+        dataclasses.replace(
+            _ok(
+                "search_policies",
+                {"sections": [{"title": "x", "heading_path": [], "text": "policy:9@p9"}]},
+            ),
+            references=("policy:4.2@p3", "policy:5.1@p4,5"),
+        ),
+        ("policy:4.2@p3", "policy:5.1@p4,5"),
+    ),
     (
         _ok(
             "search_policies",
@@ -296,7 +309,7 @@ REFERENCE_CASES = [
                 ]
             },
         ),
-        ("policy:4.2@p3", "policy:5.1@p4,5"),
+        (),
     ),
     (_ok("get_order", {"order_id": 987654, "total": "10.00", "items": []}), ("order",)),
     (ToolExecution("get_order", "unavailable", "order_not_accessible", ORDER_NOT_ACCESSIBLE), ()),
@@ -455,7 +468,7 @@ def test_ag87_provider_error_metadata_only(kit: Kit) -> None:
         reported_model=None,
         request_id="req_1",
         duration_ms=125,
-        request_bytes=6_712,
+        request_bytes=12_733,
         usage=None,
         usage_invalid=False,
     )
@@ -659,8 +672,8 @@ def test_ag116_request_bytes_per_attempt_are_literal(kit: Kit) -> None:
 
     result = kit.agent(provider).respond(session, "pedido")
 
-    # static 6,711 + history 2,978 + chain: 6 | 6 + 123 + 110
-    assert [a.request_bytes for a in result.diagnostics.attempts] == [9_695, 9_928, 9_928]
+    # static 12,732 + history 2,978 + chain: 6 | 6 + 123 + 110
+    assert [a.request_bytes for a in result.diagnostics.attempts] == [15_716, 15_949, 15_949]
     assert result.diagnostics.budget_failure is None
     assert result.diagnostics.retries_used == 1
 
@@ -727,7 +740,7 @@ def test_ag116_answered_diagnostics_full_literal(tmp_path: Path, monkeypatch) ->
                     reported_model=REPORTED_MODEL,
                     request_id="req_A",
                     duration_ms=125,
-                    request_bytes=6_713,
+                    request_bytes=12_734,
                     usage=Usage(100, 20, 120, 50, 0),
                     usage_invalid=False,
                 ),
@@ -756,3 +769,89 @@ def test_ag116_pruning_reported_after_commit(kit: Kit) -> None:
     assert session.pruned_turns == 2
     assert session.history[-1].items == (UserMessage("x"), message_item("ok", item_id="msg_final"))
     assert FunctionCallOutput("call_hist", ORDER_NOT_ACCESSIBLE) in history_items(session)
+
+
+# --- RM06-RM07: reported reasoning effort per attempt (spec 07 Review 07-10-D5) ---------
+
+
+def test_rm06_attempt_record_without_the_new_field_defaults_to_none() -> None:
+    record = AttemptRecord(
+        index=1,
+        retry=False,
+        outcome="response",
+        error_kind=None,
+        reported_model=REPORTED_MODEL,
+        request_id=None,
+        duration_ms=0,
+        request_bytes=1,
+        usage=None,
+        usage_invalid=False,
+    )
+    assert record.reasoning_effort_reported is None
+    assert make_response(()).reasoning_effort_reported is None
+
+
+def _reported(response, effort: str | None):
+    return dataclasses.replace(response, reasoning_effort_reported=effort)
+
+
+def _steps(with_effort: bool) -> list[object]:
+    def tag(response, effort):
+        return _reported(response, effort) if with_effort else response
+
+    return [
+        ProviderError("timeout", request_id="req_e1"),
+        tag(tool_round(call_item("c1")), "medium"),
+        tool_round(call_item("c2")),
+        tag(answer("Pronto."), "high"),
+    ]
+
+
+def _without_effort_and_time(records):
+    return [dataclasses.replace(r, duration_ms=0, reasoning_effort_reported=None) for r in records]
+
+
+def test_rm07_effort_copied_to_its_own_attempt_in_order(kit: Kit) -> None:
+    session = ConversationSession()
+    result = kit.agent(ScriptedProvider(*_steps(True))).respond(session, "x")
+    attempts = result.diagnostics.attempts
+    assert [(a.outcome, a.retry, a.reasoning_effort_reported) for a in attempts] == [
+        ("error", False, None),
+        ("response", True, "medium"),
+        ("response", False, None),
+        ("response", False, "high"),
+    ]
+    assert [a.request_id for a in attempts] == ["req_e1", None, None, None]
+    assert [a.reported_model for a in attempts] == [
+        None,
+        REPORTED_MODEL,
+        REPORTED_MODEL,
+        REPORTED_MODEL,
+    ]
+
+
+def test_rm07_metadata_changes_no_result_tool_or_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = []
+    for with_effort in (False, True):
+        kit = make_kit(tmp_path, monkeypatch)
+        session = ConversationSession()
+        provider = ScriptedProvider(*_steps(with_effort))
+        result = kit.agent(provider).respond(session, "x")
+        d = result.diagnostics
+        runs.append(
+            (
+                result.outcome,
+                result.text,
+                result.failure,
+                state(session),
+                provider.requests,
+                _without_effort_and_time(d.attempts),
+                [(r.tool, r.status, r.references) for r in d.tool_runs],
+                d.retries_used,
+                d.usage_missing_attempts,
+            )
+        )
+    assert runs[0] == runs[1]
+    assert runs[0][0] == "answered"

@@ -29,7 +29,16 @@ from emporio_agent.data.schema import (
     QUALITY_ENTITY_PRODUCT,
     QUALITY_NOTE_CODES,
 )
-from emporio_agent.services.pricing import CENT, PriceQuote, Promotion, quote_price
+from emporio_agent.services.pricing import (
+    CENT,
+    MAX_INSTALLMENTS,
+    MIN_INSTALLMENTS,
+    InstallmentSimulation,
+    PriceQuote,
+    Promotion,
+    quote_price,
+    simulate_installments,
+)
 
 type Availability = Literal["available", "out_of_stock", "discontinued", "coming_soon"]
 type QualityNoteCode = Literal["catalog_text_conflict", "status_stock_conflict"]
@@ -182,6 +191,8 @@ class ProductQuote:
     promotion: AppliedPromotion | None
     pix_not_combined: bool  # pix requested and an active promotion applied
     provenance: Provenance
+    # Review 03-10-INSTALLMENTS: regular quote with a count only; a simulation.
+    installments: InstallmentSimulation | None = None
 
 
 @dataclass(frozen=True)
@@ -595,12 +606,26 @@ def _check_payment_method(value: object) -> PaymentMethod:
     return value
 
 
+def _check_installments(value: object, payment_method: PaymentMethod) -> int | None:
+    """None, or an int from 2 to 12 with "regular": PIX is paid at once (Review 03-10)."""
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise CatalogInputError("installments", "invalid_type")
+    if not MIN_INSTALLMENTS <= value <= MAX_INSTALLMENTS:
+        raise CatalogInputError("installments", "out_of_range")
+    if payment_method == "pix":
+        raise CatalogInputError("installments", "not_available_for_pix")
+    return value
+
+
 def _quote(
     product_row: tuple[object, ...],
     promotion_rows: list[tuple[object, ...]],
     note_rows: list[tuple[object, ...]],
     payment_method: PaymentMethod,
     provenance: Provenance,
+    installments: int | None = None,
 ) -> ProductQuote:
     promotions = [_promotion(row) for row in promotion_rows]
     notes = tuple(sorted(_note(row) for row in note_rows))
@@ -621,6 +646,9 @@ def _quote(
         promotion=_applied_promotion(quote, promotions),
         pix_not_combined=payment_method == "pix" and quote.discount_source == "promotion",
         provenance=provenance,
+        installments=(
+            None if installments is None else simulate_installments(quote.final_price, installments)
+        ),
     )
 
 
@@ -629,8 +657,12 @@ def quote_product(
     product_id: int,
     *,
     payment_method: PaymentMethod,
+    installments: int | None = None,
 ) -> ProductQuote | None:
     """Return one unit quote for "regular" or "pix"; a quote creates no purchase.
+
+    With installments (2 to 12, "regular" only), the quote also carries a card simulation
+    of its final price (Spec 03 Review 03-10-INSTALLMENTS).
 
     None when no product has this ID. An unavailable product is quoted too, with its
     availability: the quote states the registered price, it is not an offer to sell.
@@ -640,6 +672,7 @@ def quote_product(
     """
     product_id = _check_product_id(product_id)
     payment_method = _check_payment_method(payment_method)
+    installments = _check_installments(installments, payment_method)
     product_rows = _fetch_all(connection, _SUMMARY_SQL, (product_id,))
     if not product_rows:
         return None
@@ -647,6 +680,8 @@ def quote_product(
     note_rows = _fetch_all(connection, _NOTES_SQL, (QUALITY_ENTITY_PRODUCT, product_id))
     provenance = _provenance(connection)
     try:
-        return _quote(product_rows[0], promotion_rows, note_rows, payment_method, provenance)
+        return _quote(
+            product_rows[0], promotion_rows, note_rows, payment_method, provenance, installments
+        )
     except TypeError, ValueError:
         raise CatalogDataError("invalid_row") from None

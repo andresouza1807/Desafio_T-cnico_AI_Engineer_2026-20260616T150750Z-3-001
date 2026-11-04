@@ -376,14 +376,18 @@ def test_tl65_search_page_and_policy_sections(tmp_path, catalog_kit, policy_kit,
     )
     assert execution.status == "ok"
     data = body["data"]
-    assert [section["section_id"] for section in data["sections"]] == ["3.1", "5.1", "2"]
-    assert data["omitted_section_ids"] == ["3"]
-    more = [notice for notice in data["notices"] if notice["code"] == "more_sections_matched"]
-    assert len(more) == 1
-    assert more[0]["section_ids"] == ["3"]
+    # Review 10-06: section IDs and omitted IDs are internal; references keep them.
+    assert execution.references == ("policy:3.1@p3", "policy:5.1@p4", "policy:2@p2")
+    assert (
+        data["guidance"].count(
+            "More store information matched than was returned. A more specific search can reach it."
+        )
+        == 1
+    )
+    assert '"omitted_section_ids"' not in execution.payload
     document = json.loads(index_path.read_text(encoding="utf-8"))
-    for section in data["sections"]:
-        title, text = stored_section(document, section["section_id"])
+    for section, section_id in zip(data["sections"], ("3.1", "5.1", "2"), strict=True):
+        title, text = stored_section(document, section_id)
         assert section["title"] == title
         assert section["text"] == text  # whole section text, never cut
 
@@ -391,13 +395,25 @@ def test_tl65_search_page_and_policy_sections(tmp_path, catalog_kit, policy_kit,
 # --- Result limit on policy paths, including not_found with data ----------------------
 
 
-def edited_index(tools_kit, policy_kit, directory, edit):
-    """Real index built by prepare, then one value changed with the standard json module."""
+def edited_index(tools_kit, policy_kit, directory, edit, changed_digests=None):
+    """Real index built by prepare, then one value changed with the standard json module.
+
+    Review 10-06: an edited section no longer matches its disclosure digest and is
+    withheld. Review 10-07: changed_digests registers a literal review of the edited
+    sections (written in this module); nothing is approved from the edited file.
+    """
     index_path = tools_kit.policy_index(policy_kit, directory)
     document = json.loads(index_path.read_text(encoding="utf-8"))
     edit(document)
     index_path.write_text(json.dumps(document, ensure_ascii=True), encoding="utf-8")
+    if changed_digests is not None:
+        tools_kit.register_disclosure(tools_kit.mini_review(policy_kit, changed=changed_digests))
     return index_path
+
+
+# Literal digest of section 5.1 after long_line below (Review 10-07): the base index JSON
+# with " frete" * 6000 appended to the first 5.1 line; same source SHA-256.
+LONG_SHIPPING_5_1 = {"5.1": "ea001e17ccb44dd36bb40ac4089ce65c8bccbbafa81fd51a1533efa4539c3d14"}
 
 
 def long_file_name(document):
@@ -405,15 +421,19 @@ def long_file_name(document):
 
 
 def test_policy_not_found_with_data_is_measured(tmp_path, policy_kit, tools_kit):
+    # Review 10-06: source metadata is no longer in the payload, so a long file name can
+    # no longer make a not_found result too large; the data holds fixed guidance only.
     index_path = edited_index(tools_kit, policy_kit, tmp_path, long_file_name)
     context = tools_kit.context(policy_index_path=index_path)
 
-    execution, _ = tools_kit.run(
+    execution, body = tools_kit.run(
         "search_policies", '{"query": "qual a capital da França?"}', context
     )
 
-    assert_too_large(execution, "search_policies")
+    assert (execution.status, execution.error_code) == ("not_found", "no_matching_section")
+    assert body["data"]["sections"] == []
     assert "mmmm" not in execution.payload
+    assert len(execution.payload.encode("utf-8")) < 1_000
 
 
 def test_policy_ok_over_limit_is_replaced(tmp_path, policy_kit, tools_kit):
@@ -421,12 +441,15 @@ def test_policy_ok_over_limit_is_replaced(tmp_path, policy_kit, tools_kit):
         section = next(item for item in document["sections"] if item["section_id"] == "5.1")
         section["lines"][0][1] += " frete" * 6_000
 
-    index_path = edited_index(tools_kit, policy_kit, tmp_path, long_line)
+    index_path = edited_index(
+        tools_kit, policy_kit, tmp_path, long_line, changed_digests=LONG_SHIPPING_5_1
+    )
     context = tools_kit.context(policy_index_path=index_path)
 
     execution, _ = tools_kit.run("search_policies", '{"query": "frete grátis"}', context)
 
     assert_too_large(execution, "search_policies")
+    assert execution.references == ()  # nothing was delivered (Review 10-06)
 
 
 def test_policy_lone_surrogate_is_internal_error(tmp_path, policy_kit, tools_kit):

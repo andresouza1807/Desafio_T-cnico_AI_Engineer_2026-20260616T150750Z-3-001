@@ -172,7 +172,9 @@ def test_tl58_index_replaced_between_calls(tmp_path, policy_kit, tools_kit, load
     assert second.status == "ok"
     text = body["data"]["sections"][0]["text"]
     assert new_line in text and old_line not in text
-    assert body["data"]["source"]["sha256"] == new_sha
+    # Review 10-06: the source is internal; the v2 text is served under the v2 review.
+    assert new_sha not in second.payload
+    assert second.references == ("policy:5.1@p4",)
     assert loads.loads == 2
 
 

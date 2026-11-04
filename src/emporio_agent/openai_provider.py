@@ -33,12 +33,21 @@ __all__ = [
     "MAX_OUTPUT_TOKENS",
     "MAX_RESPONSE_BODY_BYTES",
     "OpenAIResponsesProvider",
+    "REASONING_EFFORTS",
+    "REPORTED_REASONING_EFFORTS",
 ]
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 MAX_OUTPUT_TOKENS = 8000
 MAX_RESPONSE_BODY_BYTES = 1_048_576
 MAX_OUTPUT_ITEMS = 64
+# Spec G4, review 07-07-R1. None (the default) omits `reasoning`; "none" would request effort
+# none explicitly, is not equivalent to None and is out of this revision's scope.
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+# Spec G4b B8, Review 07-10-D5: values accepted as *reported* in `reasoning.effort` of a
+# response. Frozen copy of the SDK 3.42.1 `ReasoningEffort` literal; distinct from the values
+# this adapter may request.
+REPORTED_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _MAX_IDENTIFIER_CODE_POINTS = 256
 
 _QUOTA_CODES = frozenset(
@@ -73,6 +82,7 @@ def _validate_arguments(
     timeout_seconds: object,
     max_output_tokens: object,
     base_url: object,
+    reasoning_effort: object,
 ) -> str | None:
     """Return a fixed message for the first invalid argument, or None."""
     if not _plain_text(api_key):
@@ -87,6 +97,10 @@ def _validate_arguments(
         return "max_output_tokens must be a positive int"
     if not _plain_text(base_url):
         return "base_url must be a non-blank str without surrounding whitespace"
+    if reasoning_effort is not None and not (
+        type(reasoning_effort) is str and reasoning_effort in REASONING_EFFORTS
+    ):
+        return "reasoning_effort must be None or one of the supported effort values"
     return None
 
 
@@ -319,6 +333,15 @@ def _usage(data: dict[str, object]) -> tuple[Usage | None, bool]:
     return result, False
 
 
+def _reported_effort(data: dict[str, object]) -> str | None:
+    """B8: a known `reasoning.effort` str, else None. Never invalidates the response."""
+    reasoning = data.get("reasoning")
+    if type(reasoning) is not dict:
+        return None
+    effort = reasoning.get("effort")
+    return effort if type(effort) is str and effort in REPORTED_REASONING_EFFORTS else None
+
+
 def _failed(data: dict[str, object], request_id: str | None) -> ProviderError:
     """B3: transient only for a known str code; any other code type or shape -> not transient."""
     error = data.get("error")
@@ -387,6 +410,7 @@ def _parse_body(content: bytes, request_id: str | None) -> ModelResponse:
         usage=usage,
         usage_invalid=usage_invalid,
         request_id=request_id,
+        reasoning_effort_reported=_reported_effort(data),
     )
 
 
@@ -410,14 +434,18 @@ class OpenAIResponsesProvider:
         max_output_tokens: int = MAX_OUTPUT_TOKENS,
         base_url: str = DEFAULT_BASE_URL,
         http_client: httpx2.Client | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
-        problem = _validate_arguments(api_key, model, timeout_seconds, max_output_tokens, base_url)
+        problem = _validate_arguments(
+            api_key, model, timeout_seconds, max_output_tokens, base_url, reasoning_effort
+        )
         if problem is not None:
             if http_client is not None:
                 http_client.close()
             raise ValueError(problem)
         self._model = model
         self._max_output_tokens = max_output_tokens
+        self._reasoning_effort = reasoning_effort
         self._closed = False
         # Redirects are never followed (review 07-02-R1). The SDK default client enables
         # them, and max_retries=0 does not stop the extra requests a redirect causes.
@@ -459,6 +487,8 @@ class OpenAIResponsesProvider:
             "store": False,
             "max_output_tokens": self._max_output_tokens,
         }
+        if self._reasoning_effort is not None:
+            arguments["reasoning"] = {"effort": self._reasoning_effort}
         failure: ProviderError | None = None
         content = b""
         request_id: str | None = None

@@ -347,3 +347,25 @@ def test_ag108_valid_pair_and_empty_text_accepted(field):
     _BUILDERS[field]("🎸")
     _BUILDERS[field]("🎸".encode("utf-16", "surrogatepass").decode("utf-16"))
     _BUILDERS[field]("")
+
+
+def test_rm06_model_response_reported_effort_is_last_and_defaults_to_none():
+    # Spec 07 Review 07-10-D5: a defaulted last field keeps older constructions valid.
+    names = [field.name for field in dataclasses.fields(ModelResponse)]
+    assert names[-1] == "reasoning_effort_reported"
+    assert names[:-1] == [
+        "response_id",
+        "model",
+        "status",
+        "incomplete_reason",
+        "output",
+        "text",
+        "commentary_present",
+        "refusal",
+        "usage",
+        "usage_invalid",
+        "request_id",
+    ]
+    assert _response().reasoning_effort_reported is None
+    reported = dataclasses.replace(_response(), reasoning_effort_reported="low")
+    assert reported.reasoning_effort_reported == "low"

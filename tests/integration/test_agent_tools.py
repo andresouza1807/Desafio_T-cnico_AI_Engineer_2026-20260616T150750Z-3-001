@@ -299,6 +299,7 @@ def quote_210_pix_payload(base: Path) -> str:
         "discount_source": "promotion",
         "promotion": ZERO_PROMO,
         "pix_not_combined": True,
+        "installments": None,
         "provenance": catalog_provenance(base),
     }
     return compact({"tool": "quote_product", "status": "ok", "data": data, "error": None})
@@ -329,44 +330,20 @@ def order_5001_payload(base: Path) -> str:
     return compact({"tool": "get_order", "status": "ok", "data": data, "error": None})
 
 
-CURATED_UNAVAILABLE = {
-    "code": "curated_notes_unavailable",
-    "section_ids": [],
-    "message": (
-        "The policy index comes from a manual that was not reviewed for this version."
-        " No companion section or divergence notice was applied."
-    ),
-}
+# Review 10-06 (Spec 06 Review 06-05-CONF): public payload, guidance instead of notices.
+CURATED_UNAVAILABLE = (
+    "Differences between these texts were not reviewed. If two texts give different"
+    " values, do not choose one; say that the detail needs confirmation."
+)
 
 
-def policy_source(base: Path) -> dict[str, object]:
-    pdf = (base / "manual-sintetico.pdf").read_bytes()
-    return {
-        "file_name": "manual-sintetico.pdf",
-        "sha256": hashlib.sha256(pdf).hexdigest(),
-        "page_count": 5,
-    }
-
-
-def policy_payload(base: Path, sections: list[dict[str, object]]) -> str:
-    data = {
-        "sections": sections,
-        "omitted_section_ids": [],
-        "notices": [CURATED_UNAVAILABLE],
-        "source": policy_source(base),
-    }
+def policy_payload(sections: list[dict[str, object]]) -> str:
+    data = {"sections": sections, "guidance": [CURATED_UNAVAILABLE]}
     return compact({"tool": "search_policies", "status": "ok", "data": data, "error": None})
 
 
-def section(section_id, title, heading_path, pages, text):
-    return {
-        "section_id": section_id,
-        "title": title,
-        "heading_path": heading_path,
-        "pages": pages,
-        "text": text,
-        "selected_by": "match",
-    }
+def section(title, heading_path, text):
+    return {"title": title, "heading_path": heading_path, "text": text}
 
 
 # --- Resources -----------------------------------------------------------------------
@@ -472,7 +449,7 @@ def test_ag89_search_then_pix_quote_with_real_tools(
         "product:210",
         "product:201",
     )
-    assert runs[1].references == ("product:210",)
+    assert runs[1].references == ("product:210@pix",)
 
 
 # --- AG90: the next turn resends the whole previous chain -----------------------------
@@ -649,50 +626,42 @@ def test_ag93_policy_references_from_real_envelopes(
         response(call("call_p1", "search_policies", '{"query":"sedex"}')),
         response(call("call_p2", "search_policies", '{"query":"arrependimento"}')),
         response(call("call_p3", "search_policies", '{"query":"endereço"}')),
-        final("Frete: seção 5.1, página 4.", "msg_p")[0],
+        final("O frete é grátis acima de R$ 500,00.", "msg_p")[0],
     )
 
     result = make_agent(provider, absent_db, index).respond(
         ConversationSession(), "frete, arrependimento e endereço"
     )
 
-    assert_answered(result, "Frete: seção 5.1, página 4.")
+    assert_answered(result, "O frete é grátis acima de R$ 500,00.")
     assert provider.steps == [] and provider.overflow == 0
     frete = section(
-        "5.1",
         "Entregas Locais",
         ["Frete", "Entregas Locais"],
-        [4],
         "• Frete grátis acima de R$ 500,00.\n• Abaixo de R$ 500,00, taxa de R$ 35,00.",
     )
     arrependimento = section(
-        "4.1",
         "Direito de Arrependimento",
         ["Trocas e Devoluções", "Direito de Arrependimento"],
-        [3, 4],
         "Devolução em até 7 dias após o recebimento,\nexceto itens da seção 4.4.",
     )
     contatos = section(
-        "1.1",
         "Contatos",
         ["Sobre a Loja", "Contatos"],
-        [2],
         "Telefone / WhatsApp (11) 4000-1000\n"
         "E-mail atendimento@lójamodelo.com.br\n"
         "Endereço Rua das Flores, 100",
     )
+    # Review 10-06: the internal cover line "Documento interno" is withheld.
     capa = section(
-        "front_matter",
         None,
         [],
-        [1],
-        "LOJA MODELO\nRua das Flores, 100 — Centro\n"
-        "(11) 4000-1000 — atendimento@lojamodelo.com.br\nDocumento interno",
+        "LOJA MODELO\nRua das Flores, 100 — Centro\n(11) 4000-1000 — atendimento@lojamodelo.com.br",
     )
     expected_payloads = [
-        policy_payload(base, [frete]),
-        policy_payload(base, [arrependimento]),
-        policy_payload(base, [contatos, capa]),
+        policy_payload([frete]),
+        policy_payload([arrependimento]),
+        policy_payload([contatos, capa]),
     ]
     assert [c.payload for c in tool_spy.calls] == expected_payloads
     # The payloads that reached the model are the same real envelopes, by call_id.
@@ -707,12 +676,13 @@ def test_ag93_policy_references_from_real_envelopes(
         ("policy:1.1@p2", "policy:front_matter@p1"),
     ]
     assert [(r.tool, r.status, r.error_code) for r in runs] == [("search_policies", "ok", None)] * 3
-    # Section IDs and pages in the references are exactly those of the delivered envelopes.
+    # Review 10-06: references stay internal; no reference, ID or page reaches the model.
     for run, output in zip(runs, outputs, strict=True):
         sections = json.loads(output.output)["data"]["sections"]
-        assert run.references == tuple(
-            f"policy:{s['section_id']}@p{','.join(str(p) for p in s['pages'])}" for s in sections
-        )
+        assert len(run.references) == len(sections)
+        for reference in run.references:
+            assert reference not in output.output
+        assert '"section_id"' not in output.output and '"pages"' not in output.output
 
 
 # --- AG96: injection-like text stays data inside tool payloads -----------------------
@@ -759,8 +729,8 @@ def test_ag96_injection_text_is_only_tool_data(
     assert product["data"]["description"] == INJECTION  # unchanged, in the data field
     assert product_payload.count(INJECTION) == 1
     policies = json.loads(policy_payload_text)
-    assert [(s["section_id"], s["text"]) for s in policies["data"]["sections"]] == [
-        ("8", INJECTION)
+    assert [(s["title"], s["text"]) for s in policies["data"]["sections"]] == [
+        ("Avisos", INJECTION)
     ]
     assert policy_payload_text.count(INJECTION) == 1
 
@@ -780,11 +750,13 @@ def test_ag96_injection_text_is_only_tool_data(
 # --- AG117: history near the budget, measured request size and recovery --------------
 #
 # Sizes are literals written by hand and confirmed with len(...encode("utf-8")) over the
-# literal strings of this module only. Static part: STATIC_ANONYMOUS = 6,711 bytes
+# literal strings of this module only. Static part: STATIC_ANONYMOUS = 12,732 bytes
 # (session_instructions(False) plus compact tool schemas), the same literal measured in
-# report 07-03 (test_agent_limits.py); this module keeps its own copy.
+# report 10-10 (10-08: 12,295; 10-06: 11,853; 10-05: 10,789; 09-05: 9,918; 09-02: 9,084;
+# 08-10: 7,628; 07-03: 6,711;
+# test_agent_limits.py); this module keeps its own copy.
 
-STATIC_ANONYMOUS = 6_711
+STATIC_ANONYMOUS = 12_732
 SEARCH_PAYLOAD_BYTES = 2_435  # literal search_violoes_payload, confirmed below
 HISTORY_PAD = 180_000
 
@@ -830,7 +802,7 @@ def test_ag117_literal_sizes_match_their_strings(catalog_base):
     }
     assert measured == literal_sizes() | {
         "search_payload": SEARCH_PAYLOAD_BYTES,
-        "quote_payload": 1_274,
+        "quote_payload": 1_294,  # + ",\"installments\":null" (20)
         "call_m1": 180,
         "msg_m1": 136,
         "call_r1": 168,
@@ -880,10 +852,10 @@ def test_ag117_history_budget_failure_and_recovery(
     assert_answered(measured, "ok")
     # chain 1: "mais um" = 7 bytes; chain 2: + call 180 + output ("call_m1" 7 + 2,435)
     assert [a.request_bytes for a in measured.diagnostics.attempts] == [
-        6_711 + 365_696 + 7,
-        6_711 + 365_696 + 7 + 180 + 2_442,
+        12_732 + 365_696 + 7,
+        12_732 + 365_696 + 7 + 180 + 2_442,
     ]
-    assert [a.request_bytes for a in measured.diagnostics.attempts] == [372_414, 375_036]
+    assert [a.request_bytes for a in measured.diagnostics.attempts] == [378_435, 381_057]
     small_turn = (
         UserMessage("mais um"),
         small_call,
@@ -917,7 +889,7 @@ def test_ag117_history_budget_failure_and_recovery(
     assert failed.diagnostics.budget_failure == "chain"
     assert len(failing.requests) == 1 and failing.overflow == 0
     assert len(tool_spy.calls) == executions_before  # the over-budget call never ran
-    assert failed.diagnostics.attempts[0].request_bytes == 6_711 + 368_461 + 6  # "grande"
+    assert failed.diagnostics.attempts[0].request_bytes == 12_732 + 368_461 + 6  # "grande"
     assert state(session) == before
     assert flat(session) == before_items
     assert failed.diagnostics.history_pruned_turns == 1
@@ -937,7 +909,7 @@ def test_ag117_history_budget_failure_and_recovery(
         recover_call,
         quote_output,
     )
-    assert recovered.diagnostics.attempts[0].request_bytes == 6_711 + 368_461 + 9  # "e no pix?"
+    assert recovered.diagnostics.attempts[0].request_bytes == 12_732 + 368_461 + 9  # "e no pix?"
     assert session.history[:-1] == before[0]
     assert session.history[-1].items == (
         UserMessage("e no pix?"),
@@ -945,7 +917,7 @@ def test_ag117_history_budget_failure_and_recovery(
         quote_output,
         recover_item,
     )
-    # + "e no pix?" 9 + call 168 + output ("call_r1" 7 + 1,274) + message 152: no pruning
+    # + "e no pix?" 9 + call 168 + output ("call_r1" 7 + 1,294) + message 152: no pruning
     assert len(recover_item.raw.encode("utf-8")) == 152
-    assert session.history_bytes == 368_461 + 9 + 168 + 1_281 + 152
+    assert session.history_bytes == 368_461 + 9 + 168 + 1_301 + 152
     assert session.pruned_turns == 1
