@@ -185,16 +185,27 @@ With more time: a service signal for dropped policy topics, per-call references 
 
 ## Use of AI coding assistants
 
-Two assistants were used:
+I used ChatGPT/Codex and Claude Code throughout development. ChatGPT/Codex supported requirement analysis, scoped implementation prompts, code review, selected fixes, and local verification. Claude Code supported implementation, tests, debugging, and documentation.
 
-- **ChatGPT/Codex (OpenAI)** supported planning, the writing of a prompt for each slice, reviews and local checks.
-- **Claude Code (Anthropic)** is identified in the execution records of the slices as the tool that implemented and validated slices.
+### My role and decisions
 
-Git history does not attribute individual commits or files to either tool (no commit carries a co-author trailer).
+I directed the scope, tested the customer experience, and decided which limitations were acceptable for this prototype. Examples include:
 
-Workflow: work was cut into small slices. For each slice, a prompt fixed the scope and what was not authorized; the slice then went through a specification, a plan with a test checklist, failing tests, the implementation, passing gates and a validation report, and stopped for review. Real model calls ran only under execution contracts fixed before the calls, with failures recorded instead of repeated.
+- Requiring validation against the original challenge dataset. This exposed catalog-search assumptions that synthetic fixtures had missed.
+- Identifying disclosure of internal service guidelines during manual testing. This led to filtering reviewed public policy content before retrieval, keeping provenance internal, and adding output checks.
+- Challenging incorrect installment totals and unsupported mixed-payment offers. Installment calculations moved to deterministic integer-cent logic, while undefined commercial conditions require confirmation.
 
-AI support versus the candidate's decisions: the assistants planned, wrote, implemented and checked within each slice. The records show that each paid real run started only after explicit authorization, that open decisions (for example the reading of C4 turn 2, or keeping `docs/` and `.env.example` out of this snapshot) were left to the candidate, and that each slice stopped for review before the next one.
+### Development workflow
+
+Work proceeded in bounded slices: define the expected behavior, derive tests, implement, inspect failures, and validate. Paid model evaluations used predefined scenarios and limits. Failed runs were retained rather than silently replaced by successful retries.
+
+AI-generated code and passing tests were not treated as sufficient evidence. Manual conversations exposed issues in wording, confidentiality, and payment handling that offline tests had not demonstrated.
+
+### Trade-offs and limitations
+
+AI accelerated implementation and investigation, but also increased documentation overhead. The developer instructions grew close to the project's size limit. Cross-review by another AI assistant was useful, but was not independent human review.
+
+This prototype demonstrates a bounded agent, tool integration, data services, and a CLI. A web interface and production authentication remain future work. Real evaluations demonstrate individual outcomes, not a measured success rate or a guarantee against disclosure.
 
 ## Repository map
 
