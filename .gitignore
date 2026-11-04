@@ -10,7 +10,7 @@ build/
 *.egg-info/
 .env
 .env.*
-!.env.example
+/.env.example
 *.pem
 *.key
 *.sqlite
@@ -23,3 +23,13 @@ data/local/
 /docs/revisao-prompt-injection.md
 /docs/escopo-projeto.md
 /docs/architecture-and-stack.md
+/docs/
+
+# Historical conversations stay local; current delivery has five examples.
+/examples/01-catalog-budget-comparison-pix-r1.md
+/examples/01-catalog-budget-comparison-pix.md
+/examples/02-promotion-pix-unavailable.md
+/examples/03-return-regret-policy.md
+/examples/04-order-access-isolation.md
+/examples/05-hours-scope-injection-r1.md
+/examples/05-hours-scope-injection.md

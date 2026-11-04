@@ -128,6 +128,38 @@ MINI_SOURCE: dict[str, Any] = {
 }
 
 MINI_PAGE_COUNT = 5
+
+# Review 10-07 (spec 04 Review 04-17-CONF-FU item 2): literal disclosure review data of the
+# synthetic MINI manual. The test author read every MINI row above and wrote the
+# classification; the digests (SHA-256 of the compact JSON [title, [line texts]], UTF-8)
+# and the SHA-256 of the PDF laid out by policy_kit are written here as literals. They are
+# never computed from the index they approve; tests only check that they match the oracle.
+MINI_PDF_SHA256 = "18f271f0c37a9f44d5361b749584140315c488a55d7953c4d324dd9ae9ccf6fe"
+MINI_SECTION_DIGESTS: dict[str, str] = {
+    "front_matter": "42147c6cc0470a38d55a491503af6c04d0642034d81a16320b61f34d22ab288d",
+    "1": "a74bc725694bc91daaecf25687f153c6774541109b8a71d71e9676c8fd29054d",
+    "1.1": "308f076a83eba598ed785e9283db1ed9dbb43cd480ea2ca17397410aa02e10c6",
+    "2": "e8e8fe599a870a26daecd1e0ccebe2e2e151e18a14ded53bfa1d29724ff15886",
+    "3": "16bec23b4e529e8ff9c1d8fc1707b09b4166cc4c2536ca88cc3bb946a78afedd",
+    "3.1": "bc63babb7e53a5abaf894a9602c5912d1cf3d17868e28c5118cbc7f39c7e80fd",
+    "4": "ecb950f5caae55a3f0c27ededed69377248f93b260c3f4b2e9f1af5e1bde0ea3",
+    "4.1": "e6aba680b50ed7b2979b70c788dbd17b2402fcf65cc0bedf7261866a30050f33",
+    "4.2": "25a205459c181bcea5491758eeb9dcf928b43321f18ecdbac3301842877962f5",
+    "4.4": "f97038cd905e5e32eed7494a9d28f4c33d4947f905359f72ae390799c3e75be9",
+    "5": "0ecb46dbd611bc69c8f2edc1500f591b66ce3221ead99e0af2a7d4155c209ac0",
+    "5.1": "a3e7df1f862a21e31a9af5a0fb14a9ca53d8d504f28d1df0dc03c3fb98773093",
+    "6": "c7002990b3a30bedcc797a299bc0c677262b97a6783f20f841b280903ffa7814",
+    "7": "05e9c16ed8bba6c56aa5d1c759885ed3af0bdd2999a44d073ee1ff03990dae4e",
+    "8": "de515cafcb057c3f22e6184eaf90e400c3fd77437dd519eb9f146dedbdcf4e61",
+}
+# Cover "Documento interno" (position 3) and the section 7 complaint procedure and greeting
+# script (positions 1, 2) are internal; every other line is public. The section 8 injection
+# sentence stays public on purpose: it tests untrusted data, not disclosure.
+MINI_CLASSIFICATION: dict[str, tuple[str, tuple[int, ...]]] = {
+    "front_matter": ("mixed", (3,)),
+    "7": ("mixed", (1, 2)),
+}
+
 POLICY_HEADER = "Loja Modelo — Manual Sintético"
 POLICY_SENTINEL = "SENTINELA-7Q"
 
@@ -380,6 +412,12 @@ class PolicyKit:
     header: str = POLICY_HEADER
     sentinel: str = POLICY_SENTINEL
     edits: tuple[str, ...] = POLICY_EDITS
+    # Review 10-07: literal disclosure review data (see MINI_SECTION_DIGESTS).
+    pdf_sha256: str = MINI_PDF_SHA256
+    section_digests: tuple[tuple[str, str], ...] = tuple(MINI_SECTION_DIGESTS.items())
+    classification: tuple[tuple[str, tuple[str, tuple[int, ...]]], ...] = tuple(
+        MINI_CLASSIFICATION.items()
+    )
 
     @staticmethod
     def heading_line(section_id: str, title: str) -> str:

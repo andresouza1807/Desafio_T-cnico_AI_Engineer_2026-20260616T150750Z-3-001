@@ -288,3 +288,17 @@ def get_order(
         business_date=business_date,
         provenance=_provenance(connection),
     )
+
+
+# Existence check for a demonstration customer chosen by the operator (spec 08 G7, D-03).
+# Only the bound customer_id is read; no customer field is selected.
+_CUSTOMER_EXISTS_SQL: Final = "SELECT 1 FROM customers WHERE customer_id = ? LIMIT 1"
+
+
+def customer_exists(connection: sqlite3.Connection, customer: CustomerContext) -> bool:
+    """True when the prepared database has this customer. sqlite3 errors propagate."""
+    if not isinstance(customer, CustomerContext):
+        raise TypeError("customer must be a CustomerContext")
+    cursor = connection.cursor()
+    cursor.row_factory = None
+    return cursor.execute(_CUSTOMER_EXISTS_SQL, (customer.customer_id,)).fetchone() is not None
